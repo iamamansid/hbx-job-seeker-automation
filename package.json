@@ -1,0 +1,43 @@
+{
+  "name": "local-job-seeker-agent",
+  "version": "1.0.0",
+  "description": "Autonomous local job application agent using Ollama (Llama3.2), Node.js, and Playwright",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && node dist/index.js",
+    "dev": "npm run build && node dist/index.js",
+    "scrape": "npm run build && node dist/index.js",
+    "scrape:seek": "SEARCH_SOURCE=seek npm run start",
+    "scrape:linkedin": "SEARCH_SOURCE=linkedin npm run start",
+    "scrape:indeed": "SEARCH_SOURCE=indeed npm run start",
+    "browser": "BROWSER_HEADLESS=false npm run build && node dist/browser-apply.js",
+    "browser:manual": "BROWSER_HEADLESS=false npm run build && node dist/browser-apply.js --manual",
+    "browser:headless": "BROWSER_HEADLESS=true npm run build && node dist/browser-apply.js",
+    "test": "jest",
+    "test:agent": "npm run build && node dist/test.js",
+    "clean": "rm -rf dist",
+    "check:ollama": "npm run build && node dist/utils/check-ollama.js"
+  },
+  "dependencies": {
+    "playwright": "^1.48.2",
+    "dotenv": "^16.4.5",
+    "zod": "^3.23.8",
+    "axios": "^1.7.4",
+    "sqlite3": "^5.1.7",
+    "uuid": "^9.0.1",
+    "winston": "^3.14.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.6",
+    "@types/uuid": "^9.0.7",
+    "@types/jest": "^29.5.11",
+    "typescript": "^5.3.3",
+    "ts-node": "^10.9.2",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

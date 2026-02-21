@@ -1,0 +1,16 @@
+# Application Data Directory
+
+This directory contains:
+- `applications.db` - SQLite database with application history
+- `combined.log` - All application logs
+- `error.log` - Error logs only
+- `screenshots/` - Browser screenshots for debugging
+
+## Files Generated At Runtime
+
+Don't commit these files:
+- `*.db` files
+- `*.log` files
+- Screenshot images
+
+This folder is safe to delete - it will be regenerated.
