@@ -7,10 +7,17 @@ export class OllamaClient {
   private client: AxiosInstance;
   private baseUrl: string;
   private model: string;
+  private readonly thinkingLogsEnabled: boolean;
+  private readonly thinkingLogMaxChars: number;
 
   constructor() {
     this.baseUrl = config.ollama.baseUrl;
     this.model = config.ollama.model;
+    this.thinkingLogsEnabled = process.env.LLM_THINKING_LOGS !== "false";
+    this.thinkingLogMaxChars = Math.max(
+      200,
+      parseInt(process.env.LLM_THINKING_MAX_CHARS || "1800", 10) || 1800
+    );
     this.client = axios.create({
       baseURL: this.baseUrl,
       timeout: 60000, // 60 seconds - LLM can be slow
@@ -44,6 +51,7 @@ export class OllamaClient {
   async generate(prompt: string): Promise<LLMResponse<string>> {
     try {
       logger.debug("Sending prompt to Ollama:", prompt.substring(0, 100) + "...");
+      this.logThinking("generate.prompt", prompt);
 
       const response = await this.client.post("/api/generate", {
         model: this.model,
@@ -54,6 +62,11 @@ export class OllamaClient {
       });
 
       const generatedText = response.data.response || "";
+      this.logThinking("generate.response", generatedText);
+      this.logThinking(
+        "generate.tokens",
+        `prompt=${response.data.prompt_eval_count || 0}, completion=${response.data.eval_count || 0}`
+      );
 
       return {
         success: true,
@@ -85,6 +98,8 @@ ${userPrompt}
 Please respond ONLY with valid JSON in the following format (no markdown, no code blocks, no extra text):`;
 
       logger.debug("Generating JSON from Ollama, system:", systemPrompt.substring(0, 100));
+      this.logThinking("json.system", systemPrompt);
+      this.logThinking("json.user", userPrompt);
 
       const response = await this.client.post("/api/generate", {
         model: this.model,
@@ -95,6 +110,7 @@ Please respond ONLY with valid JSON in the following format (no markdown, no cod
       });
 
       const responseText = response.data.response || "";
+      this.logThinking("json.raw_response", responseText);
 
       // Try to extract JSON from response
       const jsonMatch = responseText.match(/\{[\s\S]*\}/);
@@ -103,6 +119,11 @@ Please respond ONLY with valid JSON in the following format (no markdown, no cod
       }
 
       const parsedData = JSON.parse(jsonMatch[0]) as T;
+      this.logThinking("json.parsed", JSON.stringify(parsedData));
+      this.logThinking(
+        "json.tokens",
+        `prompt=${response.data.prompt_eval_count || 0}, completion=${response.data.eval_count || 0}`
+      );
 
       return {
         success: true,
@@ -129,6 +150,7 @@ Please respond ONLY with valid JSON in the following format (no markdown, no cod
     try {
       // Ollama's chat endpoint is not available in all versions, use generate instead
       const conversationText = messages.map((m) => `${m.role}: ${m.content}`).join("\n\n");
+      this.logThinking("chat.messages", conversationText);
 
       const response = await this.client.post("/api/generate", {
         model: this.model,
@@ -137,6 +159,7 @@ Please respond ONLY with valid JSON in the following format (no markdown, no cod
         top_p: config.ollama.topP,
         stream: false,
       });
+      this.logThinking("chat.response", response.data.response || "");
 
       return {
         success: true,
@@ -166,6 +189,22 @@ ${schema}
 Extract the data and respond with ONLY the JSON object.`;
 
     return this.generateJSON<T>(systemPrompt, userPrompt);
+  }
+
+  private logThinking(stage: string, content: string): void {
+    if (!this.thinkingLogsEnabled) {
+      return;
+    }
+    const cleaned = (content || "").trim();
+    if (!cleaned) {
+      return;
+    }
+
+    const output =
+      cleaned.length > this.thinkingLogMaxChars
+        ? `${cleaned.substring(0, this.thinkingLogMaxChars)} ...[truncated]`
+        : cleaned;
+    logger.info(`[LLM:${stage}] ${output}`);
   }
 }
 

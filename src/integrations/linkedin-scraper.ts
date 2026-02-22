@@ -1,5 +1,6 @@
 import { BrowserContext, Page, chromium } from "playwright";
 import logger from "../utils/logger";
+import OllamaClient from "../llm/ollama-client";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -10,6 +11,10 @@ import * as path from "path";
 class LinkedInScraper {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
+  private lastSearchUrl: string | null = null;
+  private llm: OllamaClient | null = null;
+  private llmAvailable = false;
+  private readonly useLLMInBrowserFlow = process.env.BROWSER_LLM_THINKING !== "false";
   private chromeExecutablePath: string | null = null;
   private readonly answerHints = {
     sponsorship: process.env.REQUIRES_SPONSORSHIP === "true",
@@ -37,6 +42,16 @@ class LinkedInScraper {
     );
 
     await this.launchWithUserDataDir(automationUserDataDir, "Default");
+
+    if (this.useLLMInBrowserFlow) {
+      this.llm = new OllamaClient();
+      logger.info("LLM-assisted browser reasoning is enabled.");
+      this.llmAvailable = await this.llm.healthCheck().catch(() => false);
+      if (!this.llmAvailable) {
+        logger.warn("LLM is unavailable. External action selection will use heuristics only.");
+      }
+    }
+
     logger.info("Browser initialized");
   }
 
@@ -49,6 +64,7 @@ class LinkedInScraper {
     const searchUrl = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(
       jobTitle
     )}&location=${encodeURIComponent(location)}&f_AL=true`;
+    this.lastSearchUrl = searchUrl;
 
     logger.info("Navigating to LinkedIn Jobs...");
     await this.page.goto(searchUrl, { waitUntil: "domcontentloaded" });
@@ -96,15 +112,10 @@ class LinkedInScraper {
     let manualHelp = 0;
 
     await this.page.waitForTimeout(2500);
-    const jobItems = this.page.locator(
-      [
-        "a.job-card-list__title",
-        "a.job-card-container__link",
-        "li.jobs-search-results__list-item",
-        "li.scaffold-layout__list-item",
-        "li[data-occludable-job-id]",
-      ].join(", ")
-    );
+    const jobItems = this.getJobItemsLocator();
+    if (!jobItems) {
+      throw new Error("Job list not available");
+    }
     const cardCount = await jobItems.count();
     logger.info(`Found ${cardCount} job entries in current results list.`);
 
@@ -115,28 +126,36 @@ class LinkedInScraper {
 
     for (let i = 0; i < attempts && applied < maxApplications; i++) {
       try {
-        const item = jobItems.nth(i);
+        await this.ensureActiveLinkedInPage();
+        if (!this.page) {
+          throw new Error("LinkedIn page is not available");
+        }
+
+        const activeJobItems = this.getJobItemsLocator();
+        const activeCount = activeJobItems ? await activeJobItems.count().catch(() => 0) : 0;
+        if (!activeJobItems || i >= activeCount) {
+          logger.info("Reached end of currently loaded job cards.");
+          break;
+        }
+
+        const item = activeJobItems.nth(i);
         await item.scrollIntoViewIfNeeded();
         await item.click({ timeout: 7000 });
         await this.page.waitForTimeout(1800);
         const jobLabel = (await item.textContent().catch(() => ""))?.trim() || `Job ${i + 1}`;
         logger.info(`Opened job: ${jobLabel}`);
 
-        const easyApplyButton = await this.findVisibleLocator(
-          this.page.locator(
-            [
-              "button.jobs-apply-button",
-              "button[aria-label*='Easy Apply']",
-              "button:has-text('Easy Apply')",
-              "div.jobs-apply-button--top-card button",
-            ].join(", ")
-          )
-        );
+        const easyApplyButton = await this.findApplyActionButton("easy");
 
         if (easyApplyButton) {
           logger.info(`Opening Easy Apply modal for job ${i + 1}...`);
-          await easyApplyButton.click();
-          await this.page.waitForTimeout(1200);
+          const modalOpened = await this.clickEasyApplyAndWaitForModal(easyApplyButton);
+          if (!modalOpened) {
+            logger.warn(
+              "Easy Apply button click did not open modal. Skipping modal flow for this job."
+            );
+            continue;
+          }
 
           const result = await this.completeEasyApplyFlow(
             candidateName,
@@ -160,25 +179,13 @@ class LinkedInScraper {
           continue;
         }
 
-        const externalApplyButton = await this.findVisibleLocator(
-          this.page.locator(
-            [
-              "a.jobs-apply-button",
-              "a[href*='http']:has-text('Apply')",
-              "button:has-text('Apply on company website')",
-              "button:has-text('Apply')",
-            ].join(", ")
-          )
-        );
+        const externalApplyButton = await this.findApplyActionButton("external");
         if (externalApplyButton) {
-          logger.info("Opening external application portal for manual completion...");
+          logger.info("Opening external application portal for automated completion...");
           const externalStatus = await this.handleExternalApplication(externalApplyButton);
           if (externalStatus === "submitted") {
             applied++;
             logger.info("External application submitted.");
-          } else if (externalStatus === "manual-help") {
-            manualHelp++;
-            logger.info("External application needed manual help.");
           } else if (externalStatus === "skipped") {
             logger.info("External application skipped.");
           } else {
@@ -301,25 +308,29 @@ class LinkedInScraper {
     }
 
     let manualHelpTriggered = false;
-    await this.waitForEasyApplyModal();
+    const modalOpened = await this.waitForEasyApplyModal();
+    if (!modalOpened) {
+      return "failed";
+    }
 
     for (let step = 0; step < 8; step++) {
-      await this.autoFillForm(candidateName, candidateEmail, candidatePhone);
-      await this.uncheckFollowCompanyIfPresent();
-
       const submitButton = await this.findVisibleLocator(
         this.page.locator(
           "button[aria-label*='Submit application'], button:has-text('Submit application'), button:has-text('Submit')"
         )
       );
       if (submitButton) {
-        await submitButton.click();
+        await this.uncheckFollowCompanyIfPresent();
+        await this.clickLocatorWithFallback(submitButton, this.page);
         await this.page.waitForTimeout(2200);
         if (await this.isApplicationSubmitted()) {
           return manualHelpTriggered ? "manual-help" : "applied";
         }
         return manualHelpTriggered ? "manual-help" : "applied";
       }
+
+      await this.autoFillForm(candidateName, candidateEmail, candidatePhone);
+      await this.uncheckFollowCompanyIfPresent();
 
       const nextOrReviewButton = await this.findVisibleLocator(
         this.page.locator(
@@ -407,7 +418,15 @@ class LinkedInScraper {
       return;
     }
 
-    const dismiss = this.page
+    const modal = this.page
+      .locator(".jobs-easy-apply-modal, div[role='dialog']")
+      .first();
+    const modalVisible = await modal.isVisible({ timeout: 1200 }).catch(() => false);
+    if (!modalVisible) {
+      return;
+    }
+
+    const dismiss = modal
       .locator(
         "button[aria-label='Dismiss'], button[aria-label*='Discard'], button:has-text('Dismiss'), button[aria-label*='Close'], button:has-text('Done')"
       )
@@ -537,89 +556,51 @@ class LinkedInScraper {
 
   private async handleExternalApplication(
     applyButton: any
-  ): Promise<"submitted" | "manual-help" | "failed" | "skipped"> {
+  ): Promise<"submitted" | "failed" | "skipped"> {
     if (!this.context || !this.page) {
       return "failed";
     }
 
     const originalPage = this.page;
-    const pagesBefore = this.context.pages().length;
-
-    await applyButton.click({ timeout: 7000 }).catch(() => {});
-    await this.page.waitForTimeout(2000);
-
-    let externalPage: Page | null = null;
-    const pagesAfter = this.context.pages();
-    if (pagesAfter.length > pagesBefore) {
-      externalPage = pagesAfter[pagesAfter.length - 1];
-    } else if (!this.page.url().includes("linkedin.com")) {
-      externalPage = this.page;
-    }
+    const originalUrl = originalPage.url();
+    const externalPage = await this.resolveExternalApplicationPage(
+      applyButton,
+      originalPage,
+      originalUrl
+    );
 
     if (!externalPage) {
+      logger.info("[External] No external page detected after Apply click. Skipping.");
       return "skipped";
     }
 
     try {
+      logger.info(`[External] Detected target page: ${externalPage.url()}`);
       await externalPage.bringToFront().catch(() => {});
       await externalPage.waitForTimeout(1500);
-      await this.autoFillExternalForm(externalPage);
-
-      for (let i = 0; i < 6; i++) {
-        const submitLike = await this.findVisibleLocator(
-          externalPage.locator(
-            [
-              "button[type='submit']",
-              "input[type='submit']",
-              "button:has-text('Submit')",
-              "button:has-text('Apply')",
-              "button:has-text('Send')",
-              "button:has-text('Continue')",
-              "button:has-text('Next')",
-            ].join(", ")
-          )
-        );
-        if (!submitLike) {
-          break;
-        }
-        await submitLike.click().catch(() => {});
-        await externalPage.waitForTimeout(1500);
-        await this.autoFillExternalForm(externalPage);
-        const done = await externalPage
-          .locator("text=Application submitted, text=Thank you for applying, text=Your application has been received")
-          .first()
-          .isVisible({ timeout: 1000 })
-          .catch(() => false);
-        if (done) {
-          if (externalPage !== originalPage) {
-            await externalPage.close().catch(() => {});
-          }
-          await originalPage.bringToFront().catch(() => {});
-          this.page = originalPage;
-          return "submitted";
-        }
-      }
-
-      await this.waitForUserAction(
-        "External form needs manual completion. Submit in browser tab, then press Enter"
-      );
-      if (externalPage !== originalPage) {
-        await externalPage.close().catch(() => {});
-      }
-      await originalPage.bringToFront().catch(() => {});
-      this.page = originalPage;
-      return "manual-help";
-    } catch {
-      if (externalPage !== originalPage) {
-        await externalPage.close().catch(() => {});
-      }
-      await originalPage.bringToFront().catch(() => {});
-      this.page = originalPage;
+      const completionStatus = await this.completeExternalApplication(externalPage);
+      logger.info(`[External] Completed with status: ${completionStatus}`);
+      return completionStatus;
+    } catch (error) {
+      logger.warn("[External] Error while handling external application:", error);
       return "failed";
+    } finally {
+      await this.restoreFromExternalApplication(
+        originalPage,
+        originalUrl,
+        externalPage
+      );
     }
   }
 
   private async autoFillExternalForm(targetPage: Page): Promise<void> {
+    const contexts = this.getExternalContexts(targetPage);
+    for (const context of contexts) {
+      await this.autoFillExternalFormInContext(context);
+    }
+  }
+
+  private async autoFillExternalFormInContext(root: Page | any): Promise<void> {
     const candidateName = process.env.CANDIDATE_NAME || "Candidate";
     const candidateEmail = process.env.CANDIDATE_EMAIL || "candidate@example.com";
     const candidatePhone = process.env.CANDIDATE_PHONE || "+61000000000";
@@ -627,7 +608,7 @@ class LinkedInScraper {
     const portfolio = this.answerHints.portfolioUrl;
     const location = this.answerHints.currentLocation;
 
-    const inputs = await targetPage.locator("input, textarea, select").all();
+    const inputs = await root.locator("input, textarea, select").all();
     for (const input of inputs) {
       try {
         const tag = (await input.evaluate((el: any) => el.tagName.toLowerCase())) as string;
@@ -635,7 +616,8 @@ class LinkedInScraper {
         const name = ((await input.getAttribute("name")) || "").toLowerCase();
         const id = ((await input.getAttribute("id")) || "").toLowerCase();
         const placeholder = ((await input.getAttribute("placeholder")) || "").toLowerCase();
-        const combined = `${name} ${id} ${placeholder}`;
+        const aria = ((await input.getAttribute("aria-label")) || "").toLowerCase();
+        const combined = `${name} ${id} ${placeholder} ${aria}`;
 
         if (tag === "select") {
           const value = await input.inputValue().catch(() => "");
@@ -652,7 +634,22 @@ class LinkedInScraper {
           continue;
         }
 
-        if (type === "radio" || type === "checkbox") {
+        if (type === "radio") {
+          continue;
+        }
+
+        if (type === "checkbox") {
+          const shouldCheck =
+            combined.includes("terms") ||
+            combined.includes("privacy") ||
+            combined.includes("consent") ||
+            combined.includes("agree") ||
+            (await input.getAttribute("required")) !== null ||
+            (await input.getAttribute("aria-required")) === "true";
+          const alreadyChecked = await input.isChecked().catch(() => false);
+          if (shouldCheck && !alreadyChecked) {
+            await input.check().catch(() => {});
+          }
           continue;
         }
 
@@ -675,30 +672,650 @@ class LinkedInScraper {
           await input.fill(location).catch(() => {});
         } else if (combined.includes("experience")) {
           await input.fill(this.answerHints.yearsExperience).catch(() => {});
+        } else if (type === "number") {
+          await input.fill(this.answerHints.yearsExperience).catch(() => {});
         }
       } catch {
         // best effort
       }
     }
 
-    const fileInput = await this.findVisibleLocator(
-      targetPage.locator("input[type='file']")
-    );
-    if (fileInput && fs.existsSync(this.answerHints.resumePath)) {
-      await fileInput.setInputFiles(this.answerHints.resumePath).catch(() => {});
+    await this.answerRequiredBooleanQuestions(root as any);
+
+    if (fs.existsSync(this.answerHints.resumePath)) {
+      const fileInputs = await root.locator("input[type='file']").all();
+      for (const fileInput of fileInputs) {
+        const hasFile = await fileInput.inputValue().catch(() => "");
+        if (hasFile) {
+          continue;
+        }
+        const disabled = await fileInput.isDisabled().catch(() => false);
+        if (disabled) {
+          continue;
+        }
+        await fileInput.setInputFiles(this.answerHints.resumePath).catch(() => {});
+      }
     }
   }
 
-  private async waitForEasyApplyModal(): Promise<void> {
-    if (!this.page) {
+  private async resolveExternalApplicationPage(
+    applyButton: any,
+    originalPage: Page,
+    originalUrl: string
+  ): Promise<Page | null> {
+    if (!this.context) {
+      return null;
+    }
+
+    const pagesBefore = new Set(this.context.pages());
+    const popupPromise = this.context
+      .waitForEvent("page", { timeout: 9000 })
+      .then(async (p) => {
+        await p.waitForLoadState("domcontentloaded", { timeout: 12000 }).catch(() => {});
+        return p;
+      })
+      .catch(() => null);
+
+    const sameTabNavigationPromise = originalPage
+      .waitForURL((url) => !url.toString().toLowerCase().includes("linkedin.com"), { timeout: 7000 })
+      .then(() => originalPage)
+      .catch(() => null);
+
+    const clickedOpenTrigger = await this.clickExternalOpenTrigger(applyButton);
+    if (!clickedOpenTrigger) {
+      logger.info("[External] Could not click external apply trigger.");
+      return null;
+    }
+
+    const firstDetected = await Promise.race([
+      popupPromise,
+      sameTabNavigationPromise,
+      originalPage.waitForTimeout(2200).then(() => null),
+    ]);
+
+    if (firstDetected) {
+      return firstDetected;
+    }
+
+    const popupPage = await popupPromise;
+    if (popupPage) {
+      return popupPage;
+    }
+
+    await originalPage.waitForTimeout(1800);
+    const pagesAfter = this.context.pages();
+    const newlyOpened = pagesAfter.find((p) => !pagesBefore.has(p)) || null;
+    if (newlyOpened) {
+      await newlyOpened.waitForLoadState("domcontentloaded", { timeout: 12000 }).catch(() => {});
+      return newlyOpened;
+    }
+
+    const currentUrl = originalPage.url();
+    if (
+      currentUrl !== originalUrl &&
+      !currentUrl.includes("linkedin.com")
+    ) {
+      return originalPage;
+    }
+
+    return null;
+  }
+
+  private async completeExternalApplication(
+    externalPage: Page
+  ): Promise<"submitted" | "failed" | "skipped"> {
+    let activePage = externalPage;
+    await activePage.waitForLoadState("domcontentloaded", { timeout: 12000 }).catch(() => {});
+    let clickedAtLeastOneAction = false;
+    let noProgressStreak = 0;
+
+    for (let step = 0; step < 14; step++) {
+      activePage = await this.adoptNewestExternalPage(activePage);
+      if (activePage.isClosed()) {
+        logger.info("[External] External page closed during flow; assuming completion.");
+        return "submitted";
+      }
+
+      logger.info(`[External] Step ${step + 1}/14 - URL: ${activePage.url()}`);
+
+      if (await this.isExternalLoginRequired(activePage)) {
+        logger.info("External application requires login/authentication. Skipping this posting.");
+        return "skipped";
+      }
+
+      if (await this.isExternalVerificationGate(activePage)) {
+        logger.info("External application has anti-bot/verification gate. Skipping this posting.");
+        return "skipped";
+      }
+
+      await this.autoFillExternalForm(activePage);
+
+      if (await this.isExternalApplicationSubmitted(activePage)) {
+        return "submitted";
+      }
+
+      const beforeFingerprint = await this.getPageFingerprint(activePage);
+      const actionButton = await this.findExternalActionButton(activePage);
+      if (!actionButton) {
+        logger.info("[External] No actionable form button found on current step.");
+        await activePage.waitForTimeout(900);
+        if (await this.isExternalApplicationSubmitted(activePage)) {
+          return "submitted";
+        }
+        break;
+      }
+
+      const buttonLabel = await this.getLocatorText(actionButton);
+      logger.info(`[External] Clicking action: ${buttonLabel || "<unlabeled>"}`);
+      const clicked = await this.clickExternalAction(actionButton, activePage);
+      if (!clicked) {
+        logger.info("[External] Could not click the selected action button.");
+        break;
+      }
+      clickedAtLeastOneAction = true;
+
+      await activePage.waitForTimeout(1300);
+      activePage = await this.adoptNewestExternalPage(activePage);
+      await activePage.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+
+      const afterFingerprint = await this.getPageFingerprint(activePage);
+      if (afterFingerprint === beforeFingerprint) {
+        noProgressStreak++;
+      } else {
+        noProgressStreak = 0;
+      }
+      if (noProgressStreak >= 3) {
+        logger.info("[External] No progress after repeated clicks. Skipping this posting.");
+        return clickedAtLeastOneAction ? "failed" : "skipped";
+      }
+    }
+
+    if (await this.isExternalApplicationSubmitted(activePage)) {
+      return "submitted";
+    }
+
+    return clickedAtLeastOneAction ? "failed" : "skipped";
+  }
+
+  private async restoreFromExternalApplication(
+    originalPage: Page,
+    originalUrl: string,
+    externalPage: Page | null
+  ): Promise<void> {
+    if (externalPage && externalPage !== originalPage && !externalPage.isClosed()) {
+      await externalPage.close().catch(() => {});
+    }
+    await this.closeExtraExternalTabs(originalPage);
+
+    if (originalPage.isClosed()) {
+      if (this.context) {
+        const fallback = this.context
+          .pages()
+          .find((p) => !p.isClosed() && p.url().includes("linkedin.com"));
+        if (fallback) {
+          await fallback.bringToFront().catch(() => {});
+          this.page = fallback;
+          return;
+        }
+
+        const recovered = await this.context.newPage().catch(() => null);
+        if (recovered) {
+          const destination = this.lastSearchUrl || "https://www.linkedin.com/jobs/";
+          await recovered.goto(destination, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+          this.page = recovered;
+          await recovered.bringToFront().catch(() => {});
+          return;
+        }
+      }
       return;
     }
 
-    await this.page
+    if (!originalPage.url().includes("linkedin.com")) {
+      const destination = originalUrl.includes("linkedin.com")
+        ? originalUrl
+        : "https://www.linkedin.com/jobs/";
+      await originalPage
+        .goto(destination, { waitUntil: "domcontentloaded", timeout: 25000 })
+        .catch(() => {});
+      await originalPage.waitForTimeout(1200);
+    }
+
+    await originalPage.bringToFront().catch(() => {});
+    this.page = originalPage;
+  }
+
+  private async isExternalLoginRequired(targetPage: Page): Promise<boolean> {
+    const url = targetPage.url().toLowerCase();
+    if (
+      url.includes("login") ||
+      url.includes("sign-in") ||
+      url.includes("signin") ||
+      url.includes("auth")
+    ) {
+      return true;
+    }
+
+    const bodyText = await targetPage
+      .locator("body")
+      .innerText({ timeout: 2500 })
+      .catch(() => "");
+    const text = bodyText.toLowerCase();
+    const hasLoginCue =
+      text.includes("sign in") ||
+      text.includes("log in") ||
+      text.includes("create account") ||
+      text.includes("forgot password");
+    const hasCredentialCue =
+      text.includes("password") ||
+      text.includes("continue with google") ||
+      text.includes("continue with linkedin");
+
+    return hasLoginCue && hasCredentialCue;
+  }
+
+  private async isExternalApplicationSubmitted(targetPage: Page): Promise<boolean> {
+    const contexts = this.getExternalContexts(targetPage);
+    for (const context of contexts) {
+      const submittedIndicator = await context
+        .locator(
+          [
+            "text=Application submitted",
+            "text=Thank you for applying",
+            "text=Your application has been received",
+            "text=Application received",
+            "text=Submission complete",
+            "text=Thanks for your interest",
+            "text=We received your application",
+          ].join(", ")
+        )
+        .first()
+        .isVisible({ timeout: 900 })
+        .catch(() => false);
+      if (submittedIndicator) {
+        return true;
+      }
+    }
+
+    const url = targetPage.url().toLowerCase();
+    if (url.includes("thank-you") || url.includes("application-confirmation")) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private async findExternalActionButton(targetPage: Page): Promise<any | null> {
+    const contexts = this.getExternalContexts(targetPage);
+    const rankedCandidates: Array<{
+      locator: any;
+      label: string;
+      score: number;
+    }> = [];
+
+    for (const context of contexts) {
+      const candidates = context.locator(
+        [
+          "form button[type='submit']",
+          "form input[type='submit']",
+          "button[type='submit']",
+          "input[type='submit']",
+          "form button",
+          "form input[type='button']",
+          "button",
+          "input[type='button']",
+          "a[role='button']",
+          "a:has-text('Apply')",
+          "a:has-text('Continue')",
+          "a:has-text('Next')",
+        ].join(", ")
+      );
+      const count = await candidates.count().catch(() => 0);
+
+      for (let i = 0; i < count; i++) {
+        const candidate = candidates.nth(i);
+        const visible = await candidate.isVisible({ timeout: 400 }).catch(() => false);
+        if (!visible) {
+          continue;
+        }
+
+        const disabled = await candidate.isDisabled().catch(() => false);
+        if (disabled) {
+          continue;
+        }
+
+        const textContent = ((await candidate.textContent().catch(() => "")) || "").toLowerCase();
+        const ariaLabel = ((await candidate.getAttribute("aria-label").catch(() => "")) || "").toLowerCase();
+        const value = ((await candidate.getAttribute("value").catch(() => "")) || "").toLowerCase();
+        const href = ((await candidate.getAttribute("href").catch(() => "")) || "").toLowerCase();
+        const tagName = await candidate
+          .evaluate((el: any) => el.tagName?.toLowerCase?.() || "")
+          .catch(() => "");
+        const inForm = await candidate
+          .evaluate((el: any) => Boolean(el.closest("form")))
+          .catch(() => false);
+        const combined = `${textContent} ${ariaLabel} ${value}`.replace(/\s+/g, " ").trim();
+        if (!combined) {
+          continue;
+        }
+
+        const isInformationalAction =
+          combined.includes("how to apply") ||
+          combined.includes("learn more") ||
+          combined.includes("read more") ||
+          combined.includes("view details") ||
+          combined.includes("job details") ||
+          combined.includes("about this role");
+        if (isInformationalAction) {
+          continue;
+        }
+
+        const isAuthAction =
+          combined.includes("sign in") ||
+          combined.includes("log in") ||
+          combined.includes("create account") ||
+          combined.includes("register") ||
+          combined.includes("continue with google") ||
+          combined.includes("continue with linkedin") ||
+          combined.includes("with linkedin") ||
+          combined.includes("with google") ||
+          combined.includes("with apple") ||
+          combined.includes("with indeed");
+        if (isAuthAction) {
+          continue;
+        }
+
+        const isNegativeAction =
+          combined.includes("cancel") ||
+          combined.includes("close") ||
+          combined.includes("discard") ||
+          combined.includes("back") ||
+          combined.includes("previous");
+        if (isNegativeAction) {
+          continue;
+        }
+
+        let score = 0;
+        if (inForm) {
+          score += 25;
+        }
+        if (tagName === "button" || tagName === "input") {
+          score += 10;
+        }
+
+        if (combined.includes("submit application")) {
+          score += 120;
+        } else if (combined.includes("submit")) {
+          score += 110;
+        } else if (
+          combined.includes("complete application") ||
+          combined.includes("finish application")
+        ) {
+          score += 100;
+        } else if (
+          combined.includes("start application") ||
+          combined.includes("begin application")
+        ) {
+          score += 95;
+        } else if (combined.includes("apply now")) {
+          score += 90;
+        } else if (combined === "apply" || combined.startsWith("apply ")) {
+          score += 80;
+        } else if (combined.includes("send")) {
+          score += 78;
+        } else if (combined.includes("continue") || combined.includes("next")) {
+          score += 70;
+        } else if (combined.includes("review")) {
+          score += 65;
+        } else if (combined.includes("apply")) {
+          score += 45;
+        }
+
+        if (href) {
+          if (
+            href.includes("how-to-apply") ||
+            href.includes("candidate-how-to-apply") ||
+            href.includes("/help") ||
+            href.includes("/faq")
+          ) {
+            score -= 100;
+          } else if (
+            href.startsWith("http") &&
+            !href.includes("apply") &&
+            !href.includes("job") &&
+            !inForm
+          ) {
+            score -= 40;
+          }
+        }
+
+        if (score <= 0) {
+          continue;
+        }
+
+        rankedCandidates.push({
+          locator: candidate,
+          label: combined,
+          score,
+        });
+      }
+    }
+
+    if (rankedCandidates.length === 0) {
+      return null;
+    }
+
+    rankedCandidates.sort((a, b) => b.score - a.score);
+    const top = rankedCandidates[0];
+
+    const llmChoice = await this.selectExternalActionWithLLM(
+      targetPage,
+      rankedCandidates.slice(0, 8)
+    );
+    if (llmChoice) {
+      return llmChoice.locator;
+    }
+
+    return top.locator;
+  }
+
+  private async selectExternalActionWithLLM(
+    targetPage: Page,
+    candidates: Array<{ locator: any; label: string; score: number }>
+  ): Promise<{ locator: any; label: string; score: number } | null> {
+    if (!this.llm || !this.llmAvailable || candidates.length === 0) {
+      return null;
+    }
+
+    try {
+      const bodyText = await targetPage
+        .locator("body")
+        .innerText({ timeout: 1800 })
+        .catch(() => "");
+      const pageSnippet = bodyText.replace(/\s+/g, " ").substring(0, 1400);
+      const options = candidates
+        .map((c, idx) => `${idx}: ${c.label} (heuristicScore=${c.score})`)
+        .join("\n");
+
+      const systemPrompt = `You are selecting the single next button for an external job application flow.
+Choose the option that most likely progresses or submits the application.
+Avoid informational/navigation links like "how to apply", "learn more", "about", "faq", "back", "close", "share".
+Return only JSON.`;
+
+      const userPrompt = `URL: ${targetPage.url()}
+Candidates:
+${options}
+
+Page text snippet:
+${pageSnippet}
+
+Return:
+{
+  "choice": number,
+  "intent": "submit|progress|start|none",
+  "reason": string
+}`;
+
+      const response = await this.llm.generateJSON<{
+        choice: number;
+        intent: string;
+        reason: string;
+      }>(systemPrompt, userPrompt);
+
+      if (!response.success || !response.data) {
+        return null;
+      }
+
+      const choice = Number(response.data.choice);
+      if (!Number.isInteger(choice) || choice < 0 || choice >= candidates.length) {
+        return null;
+      }
+
+      const selected = candidates[choice];
+      logger.info(`[External][LLM] Selected action: ${selected.label}`);
+      if (response.data.reason) {
+        logger.info(`[External][LLM] Reason: ${response.data.reason}`);
+      }
+      return selected;
+    } catch (error) {
+      logger.warn("[External][LLM] Failed to select action with LLM:", error);
+      return null;
+    }
+  }
+
+  private async clickExternalOpenTrigger(locator: any): Promise<boolean> {
+    try {
+      await locator.click({ timeout: 7000 });
+      return true;
+    } catch (error) {
+      logger.warn("[External] Initial click on apply trigger failed:", error);
+      return false;
+    }
+  }
+
+  private async clickExternalAction(locator: any, targetPage: Page): Promise<boolean> {
+    try {
+      await locator.click({ timeout: 7000 });
+      return true;
+    } catch {
+      // fall through
+    }
+
+    // One fallback only. Avoid repeated clicks that can spawn duplicate tabs.
+    const jsClicked = await locator
+      .evaluate((el: any) => {
+        if (typeof el.click === "function") {
+          el.click();
+          return true;
+        }
+        return false;
+      })
+      .catch(() => false);
+    if (!jsClicked) {
+      return false;
+    }
+
+    await targetPage.waitForTimeout(500);
+    return true;
+  }
+
+  private async adoptNewestExternalPage(currentPage: Page): Promise<Page> {
+    if (!this.context) {
+      return currentPage;
+    }
+
+    const externalPages = this.context
+      .pages()
+      .filter((p) => !p.isClosed() && !p.url().includes("linkedin.com"));
+    if (externalPages.length === 0) {
+      return currentPage;
+    }
+
+    const newest = externalPages[externalPages.length - 1];
+    if (newest !== currentPage) {
+      await newest.bringToFront().catch(() => {});
+      await newest.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+      return newest;
+    }
+
+    return currentPage;
+  }
+
+  private async closeExtraExternalTabs(keepPage: Page): Promise<void> {
+    if (!this.context) {
+      return;
+    }
+
+    const toClose = this.context
+      .pages()
+      .filter(
+        (p) =>
+          !p.isClosed() &&
+          p !== keepPage &&
+          !p.url().includes("linkedin.com")
+      );
+
+    for (const page of toClose) {
+      await page.close().catch(() => {});
+    }
+  }
+
+  private async getPageFingerprint(targetPage: Page): Promise<string> {
+    if (targetPage.isClosed()) {
+      return "closed";
+    }
+
+    const url = targetPage.url().split("#")[0].split("?")[0];
+    const title = await targetPage.title().catch(() => "");
+    const body = await targetPage
+      .locator("body")
+      .innerText({ timeout: 1400 })
+      .catch(() => "");
+    const snippet = body.replace(/\s+/g, " ").toLowerCase().substring(0, 260);
+    return `${url}|${title}|${snippet}`;
+  }
+
+  private async clickLocatorWithFallback(
+    locator: any,
+    targetPage: Page
+  ): Promise<boolean> {
+    await locator.click({ timeout: 6000 }).catch(() => {});
+    await targetPage.waitForTimeout(250);
+    if (!(await locator.isVisible({ timeout: 400 }).catch(() => false))) {
+      return true;
+    }
+
+    await locator.click({ timeout: 6000, force: true }).catch(() => {});
+    await targetPage.waitForTimeout(250);
+    if (!(await locator.isVisible({ timeout: 400 }).catch(() => false))) {
+      return true;
+    }
+
+    const jsClicked = await locator
+      .evaluate((el: any) => {
+        if (typeof el.click === "function") {
+          el.click();
+          return true;
+        }
+        return false;
+      })
+      .catch(() => false);
+
+    return jsClicked;
+  }
+
+  private async waitForEasyApplyModal(): Promise<boolean> {
+    if (!this.page) {
+      return false;
+    }
+
+    const modalVisible = await this.page
       .locator(".jobs-easy-apply-modal, div[role='dialog']")
       .first()
       .waitFor({ state: "visible", timeout: 6000 })
-      .catch(() => {});
+      .then(() => true)
+      .catch(() => false);
+
+    return modalVisible;
   }
 
   private async uncheckFollowCompanyIfPresent(): Promise<void> {
@@ -747,6 +1364,177 @@ class LinkedInScraper {
       }
     }
     return null;
+  }
+
+  private async findApplyActionButton(kind: "easy" | "external"): Promise<any | null> {
+    if (!this.page) {
+      return null;
+    }
+
+    const candidates = this.page.locator(
+      [
+        "button.jobs-apply-button",
+        "a.jobs-apply-button",
+        "div.jobs-apply-button--top-card button",
+        "button[aria-label*='Apply']",
+        "a[aria-label*='Apply']",
+        "button:has-text('Apply')",
+        "a:has-text('Apply')",
+      ].join(", ")
+    );
+
+    const count = await candidates.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      const candidate = candidates.nth(i);
+      const visible = await candidate.isVisible({ timeout: 500 }).catch(() => false);
+      if (!visible) {
+        continue;
+      }
+
+      const text = (((await candidate.textContent().catch(() => "")) || "").toLowerCase()).trim();
+      const aria = (((await candidate.getAttribute("aria-label").catch(() => "")) || "").toLowerCase()).trim();
+      const combined = `${text} ${aria}`.replace(/\s+/g, " ");
+
+      const isEasyApply = combined.includes("easy apply");
+      const isApply = combined.includes("apply");
+      const isExternalApply =
+        combined.includes("company website") ||
+        combined.includes("external") ||
+        (isApply && !isEasyApply);
+
+      if (kind === "easy" && isEasyApply) {
+        return candidate;
+      }
+      if (kind === "external" && isExternalApply) {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  private async clickEasyApplyAndWaitForModal(easyApplyButton: any): Promise<boolean> {
+    if (!this.page) {
+      return false;
+    }
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt === 0) {
+        await easyApplyButton.click({ timeout: 6000 }).catch(() => {});
+      } else if (attempt === 1) {
+        await easyApplyButton.click({ timeout: 6000, force: true }).catch(() => {});
+      } else {
+        await easyApplyButton.evaluate((el: any) => {
+          if (typeof el.click === "function") {
+            el.click();
+          }
+        }).catch(() => {});
+      }
+
+      await this.page.waitForTimeout(900);
+      const modalOpened = await this.waitForEasyApplyModal();
+      if (modalOpened) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private getJobItemsLocator(): any | null {
+    if (!this.page) {
+      return null;
+    }
+    return this.page.locator(
+      [
+        "a.job-card-list__title",
+        "a.job-card-container__link",
+        "li.jobs-search-results__list-item",
+        "li.scaffold-layout__list-item",
+        "li[data-occludable-job-id]",
+      ].join(", ")
+    );
+  }
+
+  private async ensureActiveLinkedInPage(): Promise<void> {
+    if (!this.context) {
+      return;
+    }
+
+    if (this.page && !this.page.isClosed()) {
+      if (!this.page.url().includes("linkedin.com")) {
+        const destination = this.lastSearchUrl || "https://www.linkedin.com/jobs/";
+        await this.page
+          .goto(destination, { waitUntil: "domcontentloaded", timeout: 30000 })
+          .catch(() => {});
+      }
+      return;
+    }
+
+    const openPages = this.context.pages().filter((p) => !p.isClosed());
+    const linkedInPage =
+      openPages.find((p) => p.url().includes("linkedin.com")) || openPages[0] || null;
+
+    if (linkedInPage) {
+      this.page = linkedInPage;
+      await linkedInPage.bringToFront().catch(() => {});
+      return;
+    }
+
+    const fallback = await this.context.newPage().catch(() => null);
+    if (!fallback) {
+      return;
+    }
+
+    const destination = this.lastSearchUrl || "https://www.linkedin.com/jobs/";
+    await fallback.goto(destination, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+    await fallback.waitForTimeout(1200);
+    await fallback.bringToFront().catch(() => {});
+    this.page = fallback;
+  }
+
+  private getExternalContexts(targetPage: Page): Array<Page | any> {
+    const contexts: Array<Page | any> = [targetPage];
+    for (const frame of targetPage.frames()) {
+      if (frame === targetPage.mainFrame()) {
+        continue;
+      }
+      if (frame.isDetached()) {
+        continue;
+      }
+      contexts.push(frame);
+    }
+    return contexts;
+  }
+
+  private async isExternalVerificationGate(targetPage: Page): Promise<boolean> {
+    const bodyText = await targetPage
+      .locator("body")
+      .innerText({ timeout: 2500 })
+      .catch(() => "");
+    const text = bodyText.toLowerCase();
+    return (
+      text.includes("captcha") ||
+      text.includes("verify you are human") ||
+      text.includes("security check") ||
+      text.includes("cloudflare") ||
+      text.includes("unusual traffic")
+    );
+  }
+
+  private async getLocatorText(locator: any): Promise<string> {
+    const text = ((await locator.textContent().catch(() => "")) || "").trim();
+    if (text) {
+      return text.replace(/\s+/g, " ").substring(0, 120);
+    }
+
+    const aria = ((await locator.getAttribute("aria-label").catch(() => "")) || "").trim();
+    if (aria) {
+      return aria.replace(/\s+/g, " ").substring(0, 120);
+    }
+
+    const value = ((await locator.getAttribute("value").catch(() => "")) || "").trim();
+    return value.replace(/\s+/g, " ").substring(0, 120);
   }
 
   private findChromeExecutablePath(): string | null {
