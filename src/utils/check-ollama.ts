@@ -17,9 +17,8 @@ async function checkOllama() {
 
     if (models.length === 0) {
       console.log("  No models installed");
-      console.log("\nTo install Llama 3.2, run:");
-      console.log("  ollama pull llama3.2");
-      console.log("  ollama pull neural-chat");
+      console.log("\nTo install the configured model, run:");
+      console.log("  ollama pull gpt-oss:120b-cloud");
     } else {
       models.forEach((model: any) => {
         console.log(`  - ${model.name} (${(model.size / 1024 / 1024 / 1024).toFixed(2)} GB)`);
@@ -64,7 +63,7 @@ async function checkOllama() {
     console.log("\nSetup steps:");
     console.log("1. Install Ollama from https://ollama.ai");
     console.log("2. Run: ollama serve");
-    console.log("3. In another terminal, run: ollama pull llama2");
+    console.log("3. In another terminal, run: ollama pull gpt-oss:120b-cloud");
     console.log("4. Update OLLAMA_MODEL in .env if needed\n");
 
     process.exit(1);

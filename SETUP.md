@@ -4,7 +4,7 @@
 
 - [ ] Node.js 18+ installed
 - [ ] Ollama installed and running (`ollama serve`)
-- [ ] Model downloaded (`ollama pull llama2`)
+- [ ] Model downloaded (`ollama pull gpt-oss:120b-cloud`)
 - [ ] `.env` configured with your information
 - [ ] Resume PDF at `./data/resume.pdf`
 
@@ -24,7 +24,7 @@ ollama serve
 ### 3. Download a Model
 In another terminal:
 ```bash
-ollama pull llama2
+ollama pull gpt-oss:120b-cloud
 ```
 
 Or for faster inference:
@@ -75,8 +75,8 @@ Choose based on your hardware:
 |-------|------|-------|---------|------|
 | neural-chat | 4.7GB | Fast | Good | 3GB |
 | mistral | 4GB | Very Fast | Good | 3GB |
-| llama2 | 3.8GB | Medium | Good | 4GB |
-| llama2-13b | 7.4GB | Slow | Better | 8GB |
+| gpt-oss:120b-cloud | Varies | Medium | Good | 4GB+ |
+| gpt-oss:120b-cloud | Varies | Slow | Better | 8GB+ |
 
 ### Candidate Information
 Make sure to update in `.env`:
@@ -91,7 +91,7 @@ Make sure to update in `.env`:
 A: Make sure `ollama serve` is running in another terminal
 
 **Q: "Model not found"**
-A: Run `ollama pull llama2` to download
+A: Run `ollama pull gpt-oss:120b-cloud` to download
 
 **Q: "Port 11434 already in use"**
 A: Ollama is already running, or use a different port with `OLLAMA_BASE_URL`

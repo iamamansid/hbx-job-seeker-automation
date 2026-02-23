@@ -24,7 +24,7 @@ async function main() {
 
     logger.info("Configuration:");
     logger.info(
-      `  - Ollama Model: ${process.env.OLLAMA_MODEL || "llama3.2"}`
+      `  - Ollama Model: ${process.env.OLLAMA_MODEL || "gpt-oss:120b-cloud"}`
     );
     logger.info(
       `  - Max Jobs to Apply: ${process.env.MAX_JOBS_TO_APPLY || "5"}`

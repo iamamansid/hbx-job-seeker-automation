@@ -16,6 +16,19 @@ class LinkedInScraper {
   private llmAvailable = false;
   private readonly useLLMInBrowserFlow = process.env.BROWSER_LLM_THINKING !== "false";
   private chromeExecutablePath: string | null = null;
+  private currentJobContext: {
+    title: string;
+    company: string;
+    location: string;
+    description: string;
+  } = {
+    title: "",
+    company: "",
+    location: "",
+    description: "",
+  };
+  private inferredAnswerCache = new Map<string, string>();
+  private processedJobKeys = new Set<string>();
   private readonly answerHints = {
     sponsorship: process.env.REQUIRES_SPONSORSHIP === "true",
     relocate: process.env.WILLING_TO_RELOCATE === "true",
@@ -24,7 +37,8 @@ class LinkedInScraper {
     linkedInUrl: process.env.LINKEDIN_URL || "",
     portfolioUrl: process.env.PORTFOLIO_URL || "",
     currentLocation: process.env.CURRENT_LOCATION || "",
-    resumePath: process.env.RESUME_PATH || "./data/resume.pdf",
+    resumePath:
+      process.env.RESUME_PATH || "C:\\Users\\amans\\Downloads\\AmanResume_Met.pdf",
   };
 
   async initialize(): Promise<void> {
@@ -110,6 +124,7 @@ class LinkedInScraper {
     let applied = 0;
     let failed = 0;
     let manualHelp = 0;
+    this.processedJobKeys.clear();
 
     await this.page.waitForTimeout(2500);
     const jobItems = this.getJobItemsLocator();
@@ -144,6 +159,14 @@ class LinkedInScraper {
         await this.page.waitForTimeout(1800);
         const jobLabel = (await item.textContent().catch(() => ""))?.trim() || `Job ${i + 1}`;
         logger.info(`Opened job: ${jobLabel}`);
+        this.inferredAnswerCache.clear();
+        await this.captureCurrentJobContext(jobLabel);
+        const jobKey = this.getJobKey();
+        if (this.processedJobKeys.has(jobKey)) {
+          logger.info("Duplicate job card detected. Skipping duplicate attempt.");
+          continue;
+        }
+        this.processedJobKeys.add(jobKey);
 
         const easyApplyButton = await this.findApplyActionButton("easy");
 
@@ -152,8 +175,23 @@ class LinkedInScraper {
           const modalOpened = await this.clickEasyApplyAndWaitForModal(easyApplyButton);
           if (!modalOpened) {
             logger.warn(
-              "Easy Apply button click did not open modal. Skipping modal flow for this job."
+              "Easy Apply button click did not open modal. Trying external apply if available."
             );
+            const externalFallbackButton = await this.findApplyActionButton("external");
+            if (!externalFallbackButton) {
+              continue;
+            }
+            logger.info("Opening external application portal as fallback...");
+            const externalStatus = await this.handleExternalApplication(externalFallbackButton);
+            if (externalStatus === "submitted") {
+              applied++;
+              logger.info("External application submitted.");
+            } else if (externalStatus === "skipped") {
+              logger.info("External application skipped.");
+            } else {
+              failed++;
+              logger.warn("External application failed.");
+            }
             continue;
           }
 
@@ -230,13 +268,21 @@ class LinkedInScraper {
         const type = await input.getAttribute("type");
         const name = await input.getAttribute("name");
         const placeholder = await input.getAttribute("placeholder");
+        const ariaLabel = await input.getAttribute("aria-label");
+        const required =
+          (await input.getAttribute("required")) !== null ||
+          (await input.getAttribute("aria-required")) === "true";
         const value = await input.inputValue().catch(() => "");
 
         if (value && value.length > 0) {
           continue;
         }
 
-        const fieldStr = `${name || ""} ${placeholder || ""}`.toLowerCase();
+        const inferredLabel = await this.getInputLabelContext(input);
+        const fieldStr = `${name || ""} ${placeholder || ""} ${ariaLabel || ""} ${inferredLabel}`
+          .toLowerCase()
+          .replace(/\s+/g, " ")
+          .trim();
 
         if (fieldStr.includes("name") && !fieldStr.includes("company")) {
           await input.fill(candidateName);
@@ -251,6 +297,32 @@ class LinkedInScraper {
         ) {
           await input.fill(candidatePhone);
           logger.info(`Filled phone: ${candidatePhone}`);
+        } else if (fieldStr.includes("location") || fieldStr.includes("city")) {
+          if (this.answerHints.currentLocation) {
+            await input.fill(this.answerHints.currentLocation).catch(() => {});
+          }
+        } else if (fieldStr.includes("linkedin")) {
+          if (this.answerHints.linkedInUrl) {
+            await input.fill(this.answerHints.linkedInUrl).catch(() => {});
+          }
+        } else if (fieldStr.includes("portfolio") || fieldStr.includes("website")) {
+          if (this.answerHints.portfolioUrl) {
+            await input.fill(this.answerHints.portfolioUrl).catch(() => {});
+          }
+        } else if (
+          required &&
+          (type === "text" ||
+            type === "number" ||
+            type === "search" ||
+            type === "url" ||
+            type === "tel" ||
+            type === "email" ||
+            type === null)
+        ) {
+          const inferred = await this.inferFieldAnswer(fieldStr, type || "text");
+          if (inferred) {
+            await input.fill(inferred).catch(() => {});
+          }
         }
       } catch {
         // Ignore fields that cannot be edited by automation.
@@ -265,12 +337,19 @@ class LinkedInScraper {
         if (value) {
           continue;
         }
-        const options = await select.locator("option").all();
-        for (const option of options) {
-          const optionValue = (await option.getAttribute("value")) || "";
-          if (optionValue.trim().length > 0) {
-            await select.selectOption(optionValue);
-            break;
+        const name = (await select.getAttribute("name")) || "";
+        const id = (await select.getAttribute("id")) || "";
+        const aria = (await select.getAttribute("aria-label")) || "";
+        const combined = `${name} ${id} ${aria}`.toLowerCase();
+        const selected = await this.selectBestOptionForField(select, combined);
+        if (!selected) {
+          const options = await select.locator("option").all();
+          for (const option of options) {
+            const optionValue = (await option.getAttribute("value")) || "";
+            if (optionValue.trim().length > 0) {
+              await select.selectOption(optionValue);
+              break;
+            }
           }
         }
       } catch {
@@ -321,12 +400,24 @@ class LinkedInScraper {
       );
       if (submitButton) {
         await this.uncheckFollowCompanyIfPresent();
-        await this.clickLocatorWithFallback(submitButton, this.page);
+        const clickedSubmit = await this.clickPrimaryAction(submitButton, this.page);
+        if (!clickedSubmit) {
+          logger.warn("Submit button was visible but click failed. Trying next loop step.");
+          await this.page.waitForTimeout(900);
+          continue;
+        }
         await this.page.waitForTimeout(2200);
         if (await this.isApplicationSubmitted()) {
           return manualHelpTriggered ? "manual-help" : "applied";
         }
-        return manualHelpTriggered ? "manual-help" : "applied";
+        const modalStillOpen = await this.page
+          .locator(".jobs-easy-apply-modal, div[role='dialog']")
+          .first()
+          .isVisible({ timeout: 800 })
+          .catch(() => false);
+        if (!modalStillOpen) {
+          return manualHelpTriggered ? "manual-help" : "applied";
+        }
       }
 
       await this.autoFillForm(candidateName, candidateEmail, candidatePhone);
@@ -338,7 +429,7 @@ class LinkedInScraper {
         )
       );
       if (nextOrReviewButton) {
-        await nextOrReviewButton.click();
+        await this.clickPrimaryAction(nextOrReviewButton, this.page);
         await this.page.waitForTimeout(1200);
         continue;
       }
@@ -617,17 +708,21 @@ class LinkedInScraper {
         const id = ((await input.getAttribute("id")) || "").toLowerCase();
         const placeholder = ((await input.getAttribute("placeholder")) || "").toLowerCase();
         const aria = ((await input.getAttribute("aria-label")) || "").toLowerCase();
-        const combined = `${name} ${id} ${placeholder} ${aria}`;
+        const inferredLabel = (await this.getInputLabelContext(input)).toLowerCase();
+        const combined = `${name} ${id} ${placeholder} ${aria} ${inferredLabel}`.replace(/\s+/g, " ").trim();
 
         if (tag === "select") {
           const value = await input.inputValue().catch(() => "");
           if (!value) {
-            const options = await input.locator("option").all();
-            for (const o of options) {
-              const ov = (await o.getAttribute("value")) || "";
-              if (ov) {
-                await input.selectOption(ov).catch(() => {});
-                break;
+            const selected = await this.selectBestOptionForField(input, combined);
+            if (!selected) {
+              const options = await input.locator("option").all();
+              for (const o of options) {
+                const ov = (await o.getAttribute("value")) || "";
+                if (ov) {
+                  await input.selectOption(ov).catch(() => {});
+                  break;
+                }
               }
             }
           }
@@ -657,6 +752,9 @@ class LinkedInScraper {
         if (currentVal) {
           continue;
         }
+        const required =
+          (await input.getAttribute("required")) !== null ||
+          (await input.getAttribute("aria-required")) === "true";
 
         if (combined.includes("name")) {
           await input.fill(candidateName).catch(() => {});
@@ -673,7 +771,17 @@ class LinkedInScraper {
         } else if (combined.includes("experience")) {
           await input.fill(this.answerHints.yearsExperience).catch(() => {});
         } else if (type === "number") {
-          await input.fill(this.answerHints.yearsExperience).catch(() => {});
+          const inferred = await this.inferFieldAnswer(combined, "number");
+          if (inferred) {
+            await input.fill(inferred).catch(() => {});
+          } else {
+            await input.fill(this.answerHints.yearsExperience).catch(() => {});
+          }
+        } else if (required && (type === "text" || type === "search" || type === "" || tag === "textarea")) {
+          const inferred = await this.inferFieldAnswer(combined, "text");
+          if (inferred) {
+            await input.fill(inferred).catch(() => {});
+          }
         }
       } catch {
         // best effort
@@ -768,6 +876,7 @@ class LinkedInScraper {
     await activePage.waitForLoadState("domcontentloaded", { timeout: 12000 }).catch(() => {});
     let clickedAtLeastOneAction = false;
     let noProgressStreak = 0;
+    const attemptedActionsByFingerprint = new Map<string, Set<string>>();
 
     for (let step = 0; step < 14; step++) {
       activePage = await this.adoptNewestExternalPage(activePage);
@@ -795,8 +904,9 @@ class LinkedInScraper {
       }
 
       const beforeFingerprint = await this.getPageFingerprint(activePage);
-      const actionButton = await this.findExternalActionButton(activePage);
-      if (!actionButton) {
+      const excludeSignatures = attemptedActionsByFingerprint.get(beforeFingerprint) || new Set<string>();
+      const actionCandidate = await this.findExternalActionButton(activePage, excludeSignatures);
+      if (!actionCandidate) {
         logger.info("[External] No actionable form button found on current step.");
         await activePage.waitForTimeout(900);
         if (await this.isExternalApplicationSubmitted(activePage)) {
@@ -805,9 +915,9 @@ class LinkedInScraper {
         break;
       }
 
-      const buttonLabel = await this.getLocatorText(actionButton);
+      const buttonLabel = actionCandidate.label || (await this.getLocatorText(actionCandidate.locator));
       logger.info(`[External] Clicking action: ${buttonLabel || "<unlabeled>"}`);
-      const clicked = await this.clickExternalAction(actionButton, activePage);
+      const clicked = await this.clickExternalAction(actionCandidate.locator, activePage);
       if (!clicked) {
         logger.info("[External] Could not click the selected action button.");
         break;
@@ -820,6 +930,9 @@ class LinkedInScraper {
 
       const afterFingerprint = await this.getPageFingerprint(activePage);
       if (afterFingerprint === beforeFingerprint) {
+        const attempted = attemptedActionsByFingerprint.get(beforeFingerprint) || new Set<string>();
+        attempted.add(this.normalizeActionSignature(buttonLabel));
+        attemptedActionsByFingerprint.set(beforeFingerprint, attempted);
         noProgressStreak++;
       } else {
         noProgressStreak = 0;
@@ -944,7 +1057,10 @@ class LinkedInScraper {
     return false;
   }
 
-  private async findExternalActionButton(targetPage: Page): Promise<any | null> {
+  private async findExternalActionButton(
+    targetPage: Page,
+    excludeSignatures: Set<string> = new Set<string>()
+  ): Promise<{ locator: any; label: string; score: number } | null> {
     const contexts = this.getExternalContexts(targetPage);
     const rankedCandidates: Array<{
       locator: any;
@@ -1034,6 +1150,25 @@ class LinkedInScraper {
           continue;
         }
 
+        const isUtilityAction =
+          combined.includes("toggle flyout") ||
+          combined.includes("remove file") ||
+          combined.includes("dropbox") ||
+          combined.includes("google drive") ||
+          combined.includes("attach") ||
+          combined.includes("upload from") ||
+          combined.includes("enter manually") ||
+          combined.includes("share") ||
+          combined.includes("copy link");
+        if (isUtilityAction) {
+          continue;
+        }
+
+        const signature = this.normalizeActionSignature(combined);
+        if (excludeSignatures.has(signature)) {
+          continue;
+        }
+
         let score = 0;
         if (inForm) {
           score += 25;
@@ -1112,10 +1247,10 @@ class LinkedInScraper {
       rankedCandidates.slice(0, 8)
     );
     if (llmChoice) {
-      return llmChoice.locator;
+      return llmChoice;
     }
 
-    return top.locator;
+    return top;
   }
 
   private async selectExternalActionWithLLM(
@@ -1193,27 +1328,10 @@ Return:
   }
 
   private async clickExternalAction(locator: any, targetPage: Page): Promise<boolean> {
-    try {
-      await locator.click({ timeout: 7000 });
-      return true;
-    } catch {
-      // fall through
-    }
-
-    // One fallback only. Avoid repeated clicks that can spawn duplicate tabs.
-    const jsClicked = await locator
-      .evaluate((el: any) => {
-        if (typeof el.click === "function") {
-          el.click();
-          return true;
-        }
-        return false;
-      })
-      .catch(() => false);
-    if (!jsClicked) {
+    const clicked = await this.clickPrimaryAction(locator, targetPage);
+    if (!clicked) {
       return false;
     }
-
     await targetPage.waitForTimeout(500);
     return true;
   }
@@ -1301,6 +1419,34 @@ Return:
       .catch(() => false);
 
     return jsClicked;
+  }
+
+  private async clickPrimaryAction(locator: any, targetPage: Page): Promise<boolean> {
+    const stableClick = await locator
+      .scrollIntoViewIfNeeded()
+      .then(async () => {
+        await locator.click({ timeout: 6000 });
+        return true;
+      })
+      .catch(() => false);
+
+    if (stableClick) {
+      return true;
+    }
+
+    const forcedClick = await locator
+      .scrollIntoViewIfNeeded()
+      .then(async () => {
+        await locator.click({ timeout: 6000, force: true });
+        return true;
+      })
+      .catch(() => false);
+    if (!forcedClick) {
+      return false;
+    }
+
+    await targetPage.waitForTimeout(250);
+    return true;
   }
 
   private async waitForEasyApplyModal(): Promise<boolean> {
@@ -1420,8 +1566,9 @@ Return:
 
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt === 0) {
-        await easyApplyButton.click({ timeout: 6000 }).catch(() => {});
+        await this.clickPrimaryAction(easyApplyButton, this.page).catch(() => {});
       } else if (attempt === 1) {
+        await easyApplyButton.scrollIntoViewIfNeeded().catch(() => {});
         await easyApplyButton.click({ timeout: 6000, force: true }).catch(() => {});
       } else {
         await easyApplyButton.evaluate((el: any) => {
@@ -1493,6 +1640,283 @@ Return:
     this.page = fallback;
   }
 
+  private async captureCurrentJobContext(jobLabelFallback: string): Promise<void> {
+    if (!this.page) {
+      return;
+    }
+
+    const title =
+      ((await this.page
+        .locator("h1, .job-details-jobs-unified-top-card__job-title, .t-24")
+        .first()
+        .textContent()
+        .catch(() => "")) || "").trim() || jobLabelFallback;
+    const company = ((await this.page
+      .locator(
+        ".job-details-jobs-unified-top-card__company-name a, .jobs-unified-top-card__company-name a, .t-14.t-black--light"
+      )
+      .first()
+      .textContent()
+      .catch(() => "")) || "").trim();
+    const location = ((await this.page
+      .locator(".job-details-jobs-unified-top-card__primary-description-container, .jobs-unified-top-card__bullet")
+      .first()
+      .textContent()
+      .catch(() => "")) || "").trim();
+    const description = ((await this.page
+      .locator(".jobs-description__content, .jobs-box__html-content, .jobs-description-content__text")
+      .first()
+      .innerText()
+      .catch(() => "")) || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .substring(0, 3000);
+
+    this.currentJobContext = {
+      title,
+      company,
+      location,
+      description,
+    };
+  }
+
+  private async inferFieldAnswer(fieldContext: string, fieldType: string): Promise<string | null> {
+    const key = `${fieldType}:${fieldContext}`.substring(0, 300).toLowerCase();
+    const cached = this.inferredAnswerCache.get(key);
+    if (cached) {
+      return cached;
+    }
+
+    const intent = this.detectFieldIntent(fieldContext, fieldType);
+    const heuristic = this.getHeuristicFieldAnswer(fieldContext, fieldType);
+    const shouldPreferHeuristic =
+      intent === "location" ||
+      intent === "notice-period" ||
+      intent === "experience" ||
+      intent === "linkedin" ||
+      intent === "portfolio" ||
+      intent === "sponsorship" ||
+      intent === "relocate" ||
+      intent === "visa";
+
+    if (!this.llm || !this.llmAvailable) {
+      if (heuristic) {
+        this.inferredAnswerCache.set(key, heuristic);
+      }
+      return heuristic;
+    }
+    if (shouldPreferHeuristic && heuristic) {
+      this.inferredAnswerCache.set(key, heuristic);
+      return heuristic;
+    }
+
+    try {
+      const systemPrompt = `You answer job application form fields for the candidate.
+Return only the exact value for the field. No explanation, no markdown.`;
+      const userPrompt = `Field hint: ${fieldContext}
+Field type: ${fieldType}
+Field intent: ${intent}
+
+Candidate profile:
+- Name: ${process.env.CANDIDATE_NAME || "Candidate"}
+- Email: ${process.env.CANDIDATE_EMAIL || ""}
+- Phone: ${process.env.CANDIDATE_PHONE || ""}
+- Years experience: ${this.answerHints.yearsExperience}
+- Current location: ${this.answerHints.currentLocation || "Not specified"}
+- Needs sponsorship: ${this.answerHints.sponsorship ? "Yes" : "No"}
+- Will relocate: ${this.answerHints.relocate ? "Yes" : "No"}
+- LinkedIn: ${this.answerHints.linkedInUrl || "N/A"}
+- Portfolio: ${this.answerHints.portfolioUrl || "N/A"}
+
+Job context:
+- Title: ${this.currentJobContext.title || "Unknown"}
+- Company: ${this.currentJobContext.company || "Unknown"}
+- Location: ${this.currentJobContext.location || "Unknown"}
+- Description snippet: ${(this.currentJobContext.description || "").substring(0, 1200)}
+
+If this is compensation/salary related, provide a realistic expected amount or range for this role/location.
+If it asks yes/no, return just "Yes" or "No".
+If numeric field, return digits only unless range is explicitly requested.`;
+
+      const response = await this.llm.generate(userPrompt ? `${systemPrompt}\n\n${userPrompt}` : systemPrompt);
+      const raw = (response.success && response.data ? response.data : "").trim().replace(/^["']|["']$/g, "");
+      const normalized = this.normalizeInferredAnswer(raw, fieldType);
+      const cleaned = this.isAnswerCompatibleWithIntent(normalized, intent, fieldType)
+        ? normalized
+        : heuristic;
+      if (cleaned) {
+        this.inferredAnswerCache.set(key, cleaned);
+      }
+      return cleaned;
+    } catch {
+      if (heuristic) {
+        this.inferredAnswerCache.set(key, heuristic);
+      }
+      return heuristic;
+    }
+  }
+
+  private detectFieldIntent(
+    fieldContext: string,
+    fieldType: string
+  ): "salary" | "location" | "notice-period" | "linkedin" | "portfolio" | "experience" | "sponsorship" | "relocate" | "visa" | "generic" {
+    const context = fieldContext.toLowerCase();
+    if (context.includes("salary") || context.includes("compensation") || context.includes("ctc")) {
+      return "salary";
+    }
+    if (context.includes("location") || context.includes("city")) {
+      return "location";
+    }
+    if (context.includes("notice period") || context.includes("join") || context.includes("start date")) {
+      return "notice-period";
+    }
+    if (context.includes("linkedin")) {
+      return "linkedin";
+    }
+    if (context.includes("portfolio") || context.includes("website")) {
+      return "portfolio";
+    }
+    if (context.includes("visa") || context.includes("work authorization") || context.includes("work permit")) {
+      return "visa";
+    }
+    if (context.includes("sponsor") || context.includes("sponsorship")) {
+      return "sponsorship";
+    }
+    if (context.includes("relocat")) {
+      return "relocate";
+    }
+    if (context.includes("experience") || fieldType === "number") {
+      return "experience";
+    }
+    return "generic";
+  }
+
+  private isAnswerCompatibleWithIntent(
+    value: string | null,
+    intent: "salary" | "location" | "notice-period" | "linkedin" | "portfolio" | "experience" | "sponsorship" | "relocate" | "visa" | "generic",
+    fieldType: string
+  ): boolean {
+    if (!value) {
+      return false;
+    }
+    const normalized = value.trim().toLowerCase();
+    const hasSalarySignal = /\$|usd|aud|inr|eur|salary|compensation|ctc|k\b|per\s*(year|annum|hour)/i.test(
+      normalized
+    );
+    const hasDigits = /\d/.test(normalized);
+
+    if (intent === "location") {
+      return !hasSalarySignal;
+    }
+    if (intent === "salary") {
+      return hasSalarySignal || hasDigits;
+    }
+    if (intent === "experience" || fieldType === "number") {
+      return /^-?\d+(\.\d+)?$/.test(normalized);
+    }
+    if (intent === "sponsorship" || intent === "relocate" || intent === "visa") {
+      return normalized === "yes" || normalized === "no";
+    }
+    return true;
+  }
+
+  private normalizeInferredAnswer(value: string, fieldType: string): string | null {
+    if (!value) {
+      return null;
+    }
+    const compact = value.replace(/\s+/g, " ").trim();
+    if (!compact) {
+      return null;
+    }
+    if (fieldType === "number") {
+      const numeric = compact.match(/-?\d+(\.\d+)?/);
+      return numeric ? numeric[0] : null;
+    }
+    return compact.substring(0, 220);
+  }
+
+  private getHeuristicFieldAnswer(fieldContext: string, fieldType: string): string | null {
+    const context = fieldContext.toLowerCase();
+    if (context.includes("salary") || context.includes("compensation") || context.includes("ctc")) {
+      return this.getExpectedSalaryFallback();
+    }
+    if (context.includes("notice period") || context.includes("join") || context.includes("start date")) {
+      return "2 weeks";
+    }
+    if (context.includes("linkedin")) {
+      return this.answerHints.linkedInUrl || null;
+    }
+    if (context.includes("portfolio") || context.includes("website")) {
+      return this.answerHints.portfolioUrl || null;
+    }
+    if (context.includes("location") || context.includes("city")) {
+      return this.answerHints.currentLocation || null;
+    }
+    if (context.includes("visa") || context.includes("work authorization") || context.includes("sponsor")) {
+      return this.answerHints.sponsorship ? "Yes" : "No";
+    }
+    if (context.includes("relocat")) {
+      return this.answerHints.relocate ? "Yes" : "No";
+    }
+    if (context.includes("experience") || fieldType === "number") {
+      return this.answerHints.yearsExperience;
+    }
+    return null;
+  }
+
+  private getExpectedSalaryFallback(): string {
+    const text = `${this.currentJobContext.location} ${this.currentJobContext.description}`.toLowerCase();
+    const range = text.match(/(\$|usd|aud|inr|eur)\s?\d{2,3}[,\.]?\d{0,3}\s?(k|000)?\s?[-to]+\s?(\$|usd|aud|inr|eur)?\s?\d{2,3}[,\.]?\d{0,3}\s?(k|000)?/i);
+    if (range) {
+      return range[0].replace(/\s+/g, " ").trim();
+    }
+    if (text.includes("australia") || text.includes("sydney") || text.includes("melbourne")) {
+      return "AUD 130000";
+    }
+    if (text.includes("india") || text.includes("bengaluru") || text.includes("bangalore")) {
+      return "3500000";
+    }
+    return "140000";
+  }
+
+  private async selectBestOptionForField(selectLocator: any, combined: string): Promise<boolean> {
+    const options = await selectLocator.locator("option").all().catch(() => []);
+    if (!options || options.length === 0) {
+      return false;
+    }
+
+    const preferredNo = this.answerHints.sponsorship ? "yes" : "no";
+    const preferredRelocate = this.answerHints.relocate ? "yes" : "no";
+    for (const option of options) {
+      const value = ((await option.getAttribute("value").catch(() => "")) || "").toLowerCase();
+      const text = ((await option.textContent().catch(() => "")) || "").toLowerCase();
+      const optionText = `${value} ${text}`.trim();
+      if (!optionText || optionText === "select" || optionText.includes("choose")) {
+        continue;
+      }
+
+      if ((combined.includes("sponsor") || combined.includes("visa")) && optionText.includes(preferredNo)) {
+        const optionValue = (await option.getAttribute("value").catch(() => "")) || "";
+        await selectLocator.selectOption(optionValue).catch(() => {});
+        return true;
+      }
+      if (combined.includes("relocat") && optionText.includes(preferredRelocate)) {
+        const optionValue = (await option.getAttribute("value").catch(() => "")) || "";
+        await selectLocator.selectOption(optionValue).catch(() => {});
+        return true;
+      }
+      if (combined.includes("experience")) {
+        const optionValue = (await option.getAttribute("value").catch(() => "")) || "";
+        if (optionText.includes(this.answerHints.yearsExperience)) {
+          await selectLocator.selectOption(optionValue).catch(() => {});
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
   private getExternalContexts(targetPage: Page): Array<Page | any> {
     const contexts: Array<Page | any> = [targetPage];
     for (const frame of targetPage.frames()) {
@@ -1535,6 +1959,53 @@ Return:
 
     const value = ((await locator.getAttribute("value").catch(() => "")) || "").trim();
     return value.replace(/\s+/g, " ").substring(0, 120);
+  }
+
+  private async getInputLabelContext(input: any): Promise<string> {
+    return input
+      .evaluate((el: any) => {
+        const ownLabel = (el.getAttribute("aria-label") || el.getAttribute("placeholder") || "").trim();
+        const id = (el.getAttribute("id") || "").trim();
+        let forLabel = "";
+        if (id) {
+          const byFor = (globalThis as any).document?.querySelector?.(`label[for="${id}"]`);
+          forLabel = ((byFor?.innerText || byFor?.textContent || "") as string).trim();
+        }
+
+        const wrappedLabel = (el.closest("label")?.innerText || "") as string;
+        const parentText = (el.parentElement?.innerText || "").trim();
+        const nearestLegend = (el.closest("fieldset")?.querySelector("legend")?.innerText || "") as string;
+
+        return [ownLabel, forLabel, wrappedLabel, parentText, nearestLegend]
+          .filter(Boolean)
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim()
+          .substring(0, 260);
+      })
+      .catch(() => "");
+  }
+
+  private normalizeActionSignature(label: string): string {
+    return (label || "")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim()
+      .substring(0, 120);
+  }
+
+  private getJobKey(): string {
+    const parts = [
+      this.currentJobContext.title || "",
+      this.currentJobContext.company || "",
+      this.currentJobContext.location || "",
+    ];
+    return parts
+      .join("|")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim()
+      .substring(0, 240);
   }
 
   private findChromeExecutablePath(): string | null {

@@ -1,7 +1,7 @@
 {
   "name": "local-job-seeker-agent",
   "version": "1.0.0",
-  "description": "Autonomous local job application agent using Ollama (Llama3.2), Node.js, and Playwright",
+  "description": "Autonomous local job application agent using Ollama (gpt-oss:120b-cloud), Node.js, and Playwright",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
