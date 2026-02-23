@@ -579,7 +579,14 @@ class LinkedInScraper {
   }
 
   private async answerRequiredBooleanQuestions(root: Page | any): Promise<void> {
-    const groups = await root.locator("fieldset, [role='group']").all();
+    if ((root as any)?.isClosed?.()) {
+      return;
+    }
+    if ((root as any)?.isDetached?.()) {
+      return;
+    }
+
+    const groups = await root.locator("fieldset, [role='group']").all().catch(() => []);
     for (const group of groups) {
       try {
         const text = ((await group.textContent()) || "").toLowerCase();
@@ -687,11 +694,22 @@ class LinkedInScraper {
   private async autoFillExternalForm(targetPage: Page): Promise<void> {
     const contexts = this.getExternalContexts(targetPage);
     for (const context of contexts) {
-      await this.autoFillExternalFormInContext(context);
+      try {
+        await this.autoFillExternalFormInContext(context);
+      } catch {
+        // Best effort: frames/pages can detach or close during redirects/submission.
+      }
     }
   }
 
   private async autoFillExternalFormInContext(root: Page | any): Promise<void> {
+    if ((root as any)?.isClosed?.()) {
+      return;
+    }
+    if ((root as any)?.isDetached?.()) {
+      return;
+    }
+
     const candidateName = process.env.CANDIDATE_NAME || "Candidate";
     const candidateEmail = process.env.CANDIDATE_EMAIL || "candidate@example.com";
     const candidatePhone = process.env.CANDIDATE_PHONE || "+61000000000";
@@ -788,7 +806,7 @@ class LinkedInScraper {
       }
     }
 
-    await this.answerRequiredBooleanQuestions(root as any);
+    await this.answerRequiredBooleanQuestions(root as any).catch(() => {});
 
     if (fs.existsSync(this.answerHints.resumePath)) {
       const fileInputs = await root.locator("input[type='file']").all();
@@ -1050,7 +1068,13 @@ class LinkedInScraper {
     }
 
     const url = targetPage.url().toLowerCase();
-    if (url.includes("thank-you") || url.includes("application-confirmation")) {
+    if (
+      url.includes("thank-you") ||
+      url.includes("application-confirmation") ||
+      url.includes("/submitted/") ||
+      url.includes("application-submitted") ||
+      url.includes("submission-complete")
+    ) {
       return true;
     }
 
@@ -1102,6 +1126,7 @@ class LinkedInScraper {
         const textContent = ((await candidate.textContent().catch(() => "")) || "").toLowerCase();
         const ariaLabel = ((await candidate.getAttribute("aria-label").catch(() => "")) || "").toLowerCase();
         const value = ((await candidate.getAttribute("value").catch(() => "")) || "").toLowerCase();
+        const candidateType = ((await candidate.getAttribute("type").catch(() => "")) || "").toLowerCase();
         const href = ((await candidate.getAttribute("href").catch(() => "")) || "").toLowerCase();
         const tagName = await candidate
           .evaluate((el: any) => el.tagName?.toLowerCase?.() || "")
@@ -1169,6 +1194,28 @@ class LinkedInScraper {
           continue;
         }
 
+        const hasPrimaryActionIntent =
+          combined.includes("submit") ||
+          combined.includes("apply") ||
+          combined.includes("continue") ||
+          combined.includes("next") ||
+          combined.includes("review") ||
+          combined.includes("start") ||
+          combined.includes("begin") ||
+          combined.includes("proceed") ||
+          combined.includes("finish") ||
+          combined.includes("complete");
+        const hasSecondaryActionIntent =
+          combined.includes("i accept") ||
+          combined.includes("accept") ||
+          combined.includes("agree");
+        const looksLikeSubmitControl =
+          candidateType === "submit" ||
+          (tagName === "button" && combined.length <= 24 && combined.includes("submit"));
+        if (!hasPrimaryActionIntent && !looksLikeSubmitControl && !hasSecondaryActionIntent) {
+          continue;
+        }
+
         let score = 0;
         if (inForm) {
           score += 25;
@@ -1203,6 +1250,9 @@ class LinkedInScraper {
           score += 65;
         } else if (combined.includes("apply")) {
           score += 45;
+        }
+        if (candidateType === "submit") {
+          score += 40;
         }
 
         if (href) {
