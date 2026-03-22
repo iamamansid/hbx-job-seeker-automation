@@ -10,6 +10,9 @@ type GeminiGenerateOptions = {
   metadata?: Record<string, unknown>;
   logPromptPreview?: boolean;
   logResponsePreview?: boolean;
+  responseMimeType?: "application/json" | "text/plain";
+  maxOutputTokens?: number;
+  thinkingBudget?: number;
 };
 
 type GeminiPart = {
@@ -20,10 +23,16 @@ type GeminiCandidate = {
   content?: {
     parts?: GeminiPart[];
   };
+  finishReason?: string;
 };
 
 type GeminiGenerateContentResponse = {
   candidates?: GeminiCandidate[];
+  usageMetadata?: {
+    thoughtsTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+  };
 };
 
 class GeminiClient {
@@ -83,34 +92,21 @@ class GeminiClient {
           await sleep(waitMs);
         }
 
-        const response = await axios.post<GeminiGenerateContentResponse>(
-          `${this.endpoint}/${this.modelName}:generateContent`,
-          {
-            contents: [
-              {
-                role: "user",
-                parts: [{ text: prompt }],
-              },
-            ],
-            generationConfig: {
-              temperature: effectiveTemperature,
-              maxOutputTokens: seekConfig.ai.maxOutputTokens,
-            },
-          },
-          {
-            headers: {
-              "Content-Type": "application/json",
-              "x-goog-api-key": this.apiKey,
-            },
-            timeout: 120_000,
-          },
-        );
+        const response = await this.requestWithRetry(prompt, {
+          temperature: effectiveTemperature,
+          responseMimeType: options.responseMimeType,
+          maxOutputTokens: options.maxOutputTokens ?? seekConfig.ai.maxOutputTokens,
+          thinkingBudget: options.thinkingBudget ?? this.getDefaultThinkingBudget(),
+        });
 
+        const responseText = this.extractTextFromResponse(response);
         this.lastCallAt = Date.now();
-        const responseText = this.extractTextFromResponse(response.data);
 
         if (!responseText) {
-          throw new Error("Gemini response did not contain any text parts.");
+          const finishReasons = response.candidates?.map((candidate) => candidate.finishReason).filter(Boolean);
+          throw new Error(
+            `Gemini response did not contain any text parts. finishReasons=${finishReasons?.join(",") || "unknown"}, thoughtsTokenCount=${response.usageMetadata?.thoughtsTokenCount ?? 0}`,
+          );
         }
 
         logger.info("Gemini request completed", {
@@ -133,7 +129,7 @@ class GeminiClient {
       } catch (error) {
         this.lastCallAt = Date.now();
         logger.error("Gemini content generation failed", {
-          error,
+          error: this.serializeError(error),
           label: options.label ?? "unspecified",
           model: this.modelName,
           apiSurface: "gemini-direct-rest",
@@ -157,6 +153,134 @@ class GeminiClient {
     );
 
     return task;
+  }
+
+  private async requestWithRetry(
+    prompt: string,
+    request: Required<Pick<GeminiGenerateOptions, "maxOutputTokens" | "thinkingBudget">> &
+      Pick<GeminiGenerateOptions, "responseMimeType"> & { temperature: number },
+  ): Promise<GeminiGenerateContentResponse> {
+    const firstResponse = await this.postGenerateContent(prompt, request);
+    if (this.hasVisibleText(firstResponse)) {
+      return firstResponse;
+    }
+
+    if (!this.shouldRetryForTextlessResponse(firstResponse, request.thinkingBudget)) {
+      return firstResponse;
+    }
+
+    const retryRequest = {
+      ...request,
+      maxOutputTokens: Math.max(request.maxOutputTokens * 2, 2048),
+      thinkingBudget: this.getRetryThinkingBudget(request.thinkingBudget),
+    };
+
+    logger.warn("Gemini returned no visible text; retrying with adjusted generation config", {
+      model: this.modelName,
+      finishReasons: firstResponse.candidates?.map((candidate) => candidate.finishReason).filter(Boolean),
+      thoughtsTokenCount: firstResponse.usageMetadata?.thoughtsTokenCount ?? 0,
+      candidatesTokenCount: firstResponse.usageMetadata?.candidatesTokenCount ?? 0,
+      initialMaxOutputTokens: request.maxOutputTokens,
+      retryMaxOutputTokens: retryRequest.maxOutputTokens,
+      initialThinkingBudget: request.thinkingBudget,
+      retryThinkingBudget: retryRequest.thinkingBudget,
+    });
+
+    return this.postGenerateContent(prompt, retryRequest);
+  }
+
+  private async postGenerateContent(
+    prompt: string,
+    request: Required<Pick<GeminiGenerateOptions, "maxOutputTokens" | "thinkingBudget">> &
+      Pick<GeminiGenerateOptions, "responseMimeType"> & { temperature: number },
+  ): Promise<GeminiGenerateContentResponse> {
+    const generationConfig: Record<string, unknown> = {
+      temperature: request.temperature,
+      maxOutputTokens: request.maxOutputTokens,
+      thinkingConfig: {
+        thinkingBudget: request.thinkingBudget,
+      },
+    };
+
+    if (request.responseMimeType) {
+      generationConfig.responseMimeType = request.responseMimeType;
+    }
+
+    const response = await axios.post<GeminiGenerateContentResponse>(
+      `${this.endpoint}/${this.modelName}:generateContent`,
+      {
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: prompt }],
+          },
+        ],
+        generationConfig,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": this.apiKey,
+        },
+        timeout: 120_000,
+      },
+    );
+
+    return response.data;
+  }
+
+  private hasVisibleText(response: GeminiGenerateContentResponse): boolean {
+    return (response.candidates ?? [])
+      .flatMap((candidate) => candidate.content?.parts ?? [])
+      .some((part) => typeof part.text === "string" && part.text.trim().length > 0);
+  }
+
+  private shouldRetryForTextlessResponse(
+    response: GeminiGenerateContentResponse,
+    thinkingBudget: number,
+  ): boolean {
+    if (this.hasVisibleText(response)) {
+      return false;
+    }
+
+    const finishReasons = response.candidates?.map((candidate) => candidate.finishReason);
+    const hitMaxTokens = finishReasons?.includes("MAX_TOKENS") ?? false;
+    const thoughtsTokenCount = response.usageMetadata?.thoughtsTokenCount ?? 0;
+
+    return hitMaxTokens || thoughtsTokenCount > 0 || thinkingBudget > 128;
+  }
+
+  private getDefaultThinkingBudget(): number {
+    return this.modelName.startsWith("gemini-2.5")
+      ? Math.max(128, seekConfig.ai.thinkingBudget)
+      : seekConfig.ai.thinkingBudget;
+  }
+
+  private getRetryThinkingBudget(thinkingBudget: number): number {
+    return Math.max(128, Math.min(thinkingBudget, 256));
+  }
+
+  private serializeError(error: unknown): Record<string, unknown> {
+    if (axios.isAxiosError(error)) {
+      return {
+        message: error.message,
+        code: error.code,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
+      };
+    }
+
+    if (error instanceof Error) {
+      return {
+        message: error.message,
+        stack: error.stack,
+      };
+    }
+
+    return {
+      value: String(error),
+    };
   }
 }
 

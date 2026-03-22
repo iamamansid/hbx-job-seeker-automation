@@ -47,6 +47,8 @@ export interface Config {
     timeoutMs: number;
     temperature: number;
     topP: number;
+    maxOutputTokens: number;
+    thinkingBudget: number;
   };
   candidate: {
     name: string;
@@ -115,6 +117,8 @@ export const config: Config = {
     timeoutMs: parseInteger(process.env.GEMINI_TIMEOUT_MS, 120_000),
     temperature: parseFloatValue(process.env.GEMINI_TEMPERATURE, 0.2),
     topP: parseFloatValue(process.env.GEMINI_TOP_P, 0.9),
+    maxOutputTokens: parseInteger(process.env.GEMINI_MAX_OUTPUT_TOKENS, 1536),
+    thinkingBudget: parseInteger(process.env.GEMINI_THINKING_BUDGET, 256),
   },
   candidate: {
     name: requireEnv("CANDIDATE_NAME"),

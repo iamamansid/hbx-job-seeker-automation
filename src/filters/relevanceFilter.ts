@@ -163,6 +163,9 @@ Respond ONLY as JSON:
     },
     logPromptPreview: true,
     logResponsePreview: true,
+    responseMimeType: "application/json",
+    maxOutputTokens: 1536,
+    thinkingBudget: 256,
   });
   return parseGeminiJson(raw);
 };

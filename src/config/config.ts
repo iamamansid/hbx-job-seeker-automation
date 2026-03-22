@@ -187,6 +187,7 @@ export interface SeekAutomationConfig {
     apiKey: string;
     model: "gemini-2.5-pro";
     maxOutputTokens: number;
+    thinkingBudget: number;
     minDelayBetweenCallsMs: number;
   };
   telegram: {
@@ -251,7 +252,8 @@ export const seekConfig: SeekAutomationConfig = {
   ai: {
     apiKey: requireEnv("GEMINI_API_KEY"),
     model: "gemini-2.5-pro",
-    maxOutputTokens: 1024,
+    maxOutputTokens: parseNumber(process.env.GEMINI_MAX_OUTPUT_TOKENS, 1536),
+    thinkingBudget: parseNumber(process.env.GEMINI_THINKING_BUDGET, 256),
     minDelayBetweenCallsMs: 1_000,
   },
   telegram: {
