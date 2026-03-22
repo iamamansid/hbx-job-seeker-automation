@@ -1,195 +1,229 @@
-import OllamaClient from "../llm/ollama-client";
-import logger from "../utils/logger";
+import { config, type Config } from "../config/index";
 import {
-  JobDescription,
-  RelevancyDecision,
-  RelevancyDecisionSchema,
-  ApplicationPlan,
   ApplicationPlanSchema,
+  JobDescriptionSchema,
+  RelevancyDecisionSchema,
+  type ApplicationPlan,
+  type JobDescription,
+  type LLMClient,
+  type RelevancyDecision,
 } from "../types/index";
-import { config } from "../config/index";
+import { logger } from "../utils/logger";
 
 export class PlannerAgent {
-  private llm: OllamaClient;
+  constructor(
+    private readonly llmClient: LLMClient,
+    private readonly runtimeConfig: Config = config,
+  ) {}
 
-  constructor() {
-    this.llm = new OllamaClient();
-  }
-
-  /**
-   * Analyze job description and decide relevance
-   */
   async analyzeRelevance(jobDesc: JobDescription): Promise<RelevancyDecision> {
     try {
-      logger.info(`Analyzing relevance for: ${jobDesc.jobTitle} at ${jobDesc.companyName}`);
+      const prompt = `
+You are a senior recruiter evaluating whether a Java backend engineer who needs Australian visa sponsorship should apply.
 
-      const systemPrompt = `You are an expert recruiter analyzing job postings for a candidate. Evaluate the job based on the candidate's background and determine if this is a relevant opportunity.
+Return valid JSON with:
+- isRelevant: boolean
+- relevanceScore: number from 0 to 100
+- visaSponsorshipScore: number from 0 to 10
+- reasoning: string
+- criteriaMatched: string[]
+- criteriaNotMatched: string[]
 
-Return a JSON object with:
-- isRelevant (boolean): Is this a good match?
-- relevanceScore (0-100): How well does the candidate fit?
-- reasoning (string): Why is this relevant/not relevant?
-- criteriaMatched (array): What requirements match the candidate?
-- criteriaNotMatched (array): What's missing?`;
+Candidate profile:
+- Experience: ${this.runtimeConfig.candidate.yearsOfExperience} years
+- Primary skills: ${this.runtimeConfig.candidate.primarySkills.join(", ")}
+- Secondary skills: ${this.runtimeConfig.candidate.secondarySkills.join(", ")}
+- Requires sponsorship: ${this.runtimeConfig.candidate.requiresSponsorship}
+- Willing to relocate: ${this.runtimeConfig.candidate.willingToRelocate}
+- Current location: ${this.runtimeConfig.candidate.currentLocation || "Not provided"}
 
-      const userPrompt = `
-CANDIDATE PROFILE:
-- Years of Experience: ${config.candidate.yearsOfExperience}
-- Primary Skills: ${config.candidate.primarySkills.join(", ")}
-- Secondary Skills: ${config.candidate.secondarySkills.join(", ")}
-- Willing to Relocate: ${config.candidate.willingToRelocate}
-- Requires Sponsorship: ${config.candidate.requiresSponsorship}
-- Location: ${config.candidate.currentLocation}
+Weight these Australia-specific signals heavily.
 
-JOB POSTING:
-Title: ${jobDesc.jobTitle}
-Company: ${jobDesc.companyName}
-Location: ${jobDesc.location}
-Work Type: ${jobDesc.workType}
-Requirements: ${jobDesc.requirements?.join(", ") || "Not specified"}
-Responsibilities: ${jobDesc.responsibilities?.join(", ") || "Not specified"}
-Full Description: ${jobDesc.fullDescription?.substring(0, 500) || "Not provided"}
+Positive signals:
+- Mentions "482 visa", "visa sponsorship", "willing to sponsor", or "overseas applicants welcome"
+- Java + Spring Boot + Microservices
+- Azure or GCP
+- Sponsoring employers such as Deloitte, Accenture, Capgemini, ANZ, NAB, Westpac, Commonwealth Bank, Atlassian, Canva, AWS, Microsoft AU
+- Role location in NSW, VIC, QLD, SA, WA, or ACT
+- Salary above AUD 90,000
 
-Analyze this job and respond with JSON:`;
+Negative signals:
+- No mention of visa or sponsorship
+- Requires Australian citizenship or PR
+- Says "Australian citizens only", "must have full work rights", or similar
+- Requires security clearance
+- Location is NT or Tasmania
 
-      const response = await this.llm.generateJSON<RelevancyDecision>(
-        systemPrompt,
-        userPrompt + `
+Interpret visaSponsorshipScore as:
+- 0 to 3: explicit blocker or no realistic sponsorship path
+- 4 to 5: ambiguous sponsorship
+- 6 to 8: reasonable sponsorship chance
+- 9 to 10: explicit sponsorship support
 
-{
-  "isRelevant": boolean,
-  "relevanceScore": number,
-  "reasoning": string,
-  "criteriaMatched": [string],
-  "criteriaNotMatched": [string]
-}`,
-      );
+Job posting:
+${JSON.stringify(jobDesc, null, 2)}
+`;
 
-      if (!response.success || !response.data) {
-        throw new Error(response.error || "Failed to analyze relevance");
-      }
-
-      logger.info(`Relevance Analysis: ${response.data.relevanceScore}% - ${response.data.isRelevant ? "RELEVANT" : "NOT RELEVANT"}`);
-      return response.data;
+      return await this.llmClient.generateJSON<RelevancyDecision>(prompt, RelevancyDecisionSchema);
     } catch (error) {
-      logger.error("Error analyzing relevance:", error);
-      // Fallback: assume low relevance if analysis fails
-      return {
-        isRelevant: false,
-        relevanceScore: 0,
-        reasoning: "Failed to analyze: " + (error instanceof Error ? error.message : "Unknown error"),
-        criteriaMatched: [],
-        criteriaNotMatched: ["Unable to analyze"],
-      };
+      logger.warn("Falling back to heuristic relevancy analysis", { error });
+      return this.getHeuristicRelevancy(jobDesc);
     }
   }
 
-  /**
-   * Create application plan for a job
-   */
   async planApplication(jobDesc: JobDescription): Promise<ApplicationPlan> {
     try {
-      logger.info(`Creating application plan for: ${jobDesc.jobTitle}`);
+      const prompt = `
+You are a strategic job application planner for an Australia-focused visa sponsorship job search.
 
-      const systemPrompt = `You are a strategic career consultant. Create a detailed plan for filling out a job application to maximize the candidate's chances. Consider the job requirements and suggest how to highlight relevant experience.
+Return valid JSON with:
+- shouldApply: boolean
+- estimatedFillTime: number in seconds
+- fieldStrategy: object mapping field names to strategy notes
+- expectedChallenges: string[]
+- keyPracticesToHighlight: string[]
 
-Return a JSON object with:
-- shouldApply (boolean): Should the candidate apply?
-- estimatedFillTime (number): Estimated seconds to complete application
-- fieldStrategy (object): Key -> how to approach each field
-- expectedChallenges (array): What obstacles might we face?
-- keyPracticesToHighlight (array): What should we emphasize?`;
+Candidate profile:
+- Skills: ${this.runtimeConfig.candidate.primarySkills.join(", ")}
+- Cloud experience: ${this.runtimeConfig.candidate.secondarySkills.join(", ")}
+- Experience: ${this.runtimeConfig.candidate.yearsOfExperience} years
+- Sponsorship required: ${this.runtimeConfig.candidate.requiresSponsorship}
 
-      const userPrompt = `
-JOB DETAILS:
-Title: ${jobDesc.jobTitle}
-Company: ${jobDesc.companyName}
-Requirements: ${jobDesc.requirements?.join(", ") || "Not specified"}
-Responsibilities: ${jobDesc.responsibilities?.join(", ") || "Not specified"}
-Description: ${jobDesc.fullDescription?.substring(0, 800) || "Not provided"}
+Job posting:
+${JSON.stringify(jobDesc, null, 2)}
 
-CANDIDATE INFO:
-Skills: ${config.candidate.primarySkills.join(", ")}
-Experience: ${config.candidate.yearsOfExperience} years
-Location: ${config.candidate.currentLocation}
+Make the plan conservative. If sponsorship odds are poor, set shouldApply to false.
+`;
 
-Create an application strategy and respond with JSON:`;
-
-      const response = await this.llm.generateJSON<ApplicationPlan>(
-        systemPrompt,
-        userPrompt + `
-
-{
-  "shouldApply": boolean,
-  "estimatedFillTime": number,
-  "fieldStrategy": {
-    "field_name": "strategy description"
-  },
-  "expectedChallenges": [string],
-  "keyPracticesToHighlight": [string]
-}`,
-      );
-
-      if (!response.success || !response.data) {
-        throw new Error(response.error || "Failed to create plan");
-      }
-
-      logger.info(`Application plan created. Should apply: ${response.data.shouldApply}`);
-      return response.data;
+      return await this.llmClient.generateJSON<ApplicationPlan>(prompt, ApplicationPlanSchema);
     } catch (error) {
-      logger.error("Error creating application plan:", error);
-      // Fallback plan
+      logger.warn("Falling back to heuristic application plan", { error });
       return {
-        shouldApply: false,
-        estimatedFillTime: 300,
-        fieldStrategy: {},
-        expectedChallenges: ["Unable to create detailed plan"],
-        keyPracticesToHighlight: [],
+        shouldApply: true,
+        estimatedFillTime: 480,
+        fieldStrategy: {
+          resume: "Upload the latest backend engineering resume.",
+          sponsorship: "Answer honestly that sponsorship is required.",
+        },
+        expectedChallenges: ["Potential sponsorship eligibility questions"],
+        keyPracticesToHighlight: this.runtimeConfig.candidate.primarySkills.slice(0, 4),
       };
     }
   }
 
-  /**
-   * Extract job description from HTML content
-   */
   async extractJobDescription(htmlContent: string): Promise<JobDescription | null> {
     try {
-      logger.debug("Extracting job description from HTML...");
+      const prompt = `
+Extract structured job posting information from the following HTML snippet.
+Return valid JSON with fields:
+- jobTitle
+- companyName
+- location
+- workType
+- requirements
+- responsibilities
+- benefits
+- fullDescription
+- salaryRange
 
-      const systemPrompt = `Extract structured job posting information from the given HTML. Look for job title, company name, location, requirements, responsibilities, and benefits. Return only valid JSON.`;
+HTML:
+${htmlContent.slice(0, 6000)}
+`;
 
-      const userPrompt = `HTML Content (first 2000 chars):
-${htmlContent.substring(0, 2000)}
-
-Extract and return:`;
-
-      const response = await this.llm.generateJSON<JobDescription>(
-        systemPrompt,
-        userPrompt + `
-
-{
-  "jobTitle": string,
-  "companyName": string,
-  "location": string,
-  "workType": string,
-  "requirements": [string],
-  "responsibilities": [string],
-  "benefits": [string],
-  "fullDescription": string
-}`,
-      );
-
-      if (!response.success) {
-        logger.warn("Failed to extract job description from HTML");
-        return null;
-      }
-
-      return response.data || null;
+      return await this.llmClient.generateJSON<JobDescription>(prompt, JobDescriptionSchema);
     } catch (error) {
-      logger.error("Error extracting job description:", error);
+      logger.warn("Unable to extract structured job description", { error });
       return null;
     }
   }
-}
 
-export default PlannerAgent;
+  private getHeuristicRelevancy(jobDesc: JobDescription): RelevancyDecision {
+    const description = [
+      jobDesc.jobTitle,
+      jobDesc.companyName,
+      jobDesc.location,
+      jobDesc.salaryRange,
+      jobDesc.fullDescription,
+      ...(jobDesc.requirements ?? []),
+      ...(jobDesc.responsibilities ?? []),
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+
+    const matched: string[] = [];
+    const missed: string[] = [];
+
+    const includes = (value: string): boolean => description.includes(value);
+
+    const skillSignals = ["java", "spring boot", "microservices"];
+    let relevanceScore = 0;
+    for (const signal of skillSignals) {
+      if (includes(signal)) {
+        matched.push(`Matched ${signal}`);
+        relevanceScore += 20;
+      } else {
+        missed.push(`Missing ${signal}`);
+      }
+    }
+
+    if (includes("azure") || includes("gcp")) {
+      matched.push("Cloud stack alignment");
+      relevanceScore += 10;
+    }
+
+    let visaSponsorshipScore = 3;
+    if (
+      includes("visa sponsorship") ||
+      includes("482 visa") ||
+      includes("willing to sponsor") ||
+      includes("overseas applicants welcome")
+    ) {
+      matched.push("Visa sponsorship language present");
+      visaSponsorshipScore = 8;
+      relevanceScore += 20;
+    } else {
+      missed.push("No explicit visa sponsorship wording");
+    }
+
+    if (
+      includes("australian citizen") ||
+      includes("citizens only") ||
+      includes("full work rights") ||
+      includes("security clearance")
+    ) {
+      missed.push("Explicit work-rights restriction");
+      visaSponsorshipScore = 0;
+      relevanceScore = Math.max(0, relevanceScore - 40);
+    }
+
+    if (includes("nsw") || includes("vic") || includes("qld") || includes("wa") || includes("sa") || includes("act")) {
+      matched.push("Preferred Australian location");
+      relevanceScore += 10;
+    }
+
+    if (includes("tas") || includes("tasmania") || includes("nt") || includes("northern territory")) {
+      missed.push("Low-priority location");
+      relevanceScore = Math.max(0, relevanceScore - 10);
+    }
+
+    if (includes("aud") || includes("90000")) {
+      matched.push("Salary signal present");
+      relevanceScore += 10;
+    }
+
+    relevanceScore = Math.max(0, Math.min(100, relevanceScore));
+
+    return {
+      isRelevant: relevanceScore >= 50 && visaSponsorshipScore >= 6,
+      relevanceScore,
+      visaSponsorshipScore,
+      reasoning:
+        visaSponsorshipScore >= 6
+          ? "Heuristic analysis found sponsorship-positive wording and relevant Java backend signals."
+          : "Heuristic analysis did not find enough sponsorship support or relevant stack coverage.",
+      criteriaMatched: matched,
+      criteriaNotMatched: missed,
+    };
+  }
+}

@@ -1,306 +1,315 @@
-import { chromium, Page, Browser, BrowserContext } from "playwright";
-import { config } from "../config/index";
-import logger from "../utils/logger";
-import { FormField, Form } from "../types/index";
+import type { BrowserContext, Page } from "playwright";
+
+import { config, type Config } from "../config/index";
+import { type Form, type FormField } from "../types/index";
+import { logger } from "../utils/logger";
+import { BrowserLifecycleManager } from "./browser-lifecycle-manager";
+
+type EvaluatedFormField = FormField;
+
+type EvaluatedForm = Form;
 
 export class BrowserAgent {
-  private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
 
+  constructor(
+    private readonly browserLifecycleManager: BrowserLifecycleManager,
+    private readonly runtimeConfig: Config = config,
+  ) {}
+
   async launch(): Promise<void> {
-    try {
-      logger.info("Launching browser...");
-      this.browser = await chromium.launch({
-        headless: config.browser.headless,
-      });
-
-      this.context = await this.browser.newContext({
-        userAgent:
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      });
-
-      this.page = await this.context.newPage();
-
-      // Set viewport
-      await this.page.setViewportSize({ width: 1920, height: 1080 });
-
-      logger.info("Browser launched successfully");
-    } catch (error) {
-      logger.error("Failed to launch browser:", error);
-      throw error;
+    if (this.page && !this.page.isClosed()) {
+      return;
     }
+
+    const { context, page } = await this.browserLifecycleManager.createPage();
+    this.context = context;
+    this.page = page;
+    await page.setViewportSize({ width: 1440, height: 960 });
+    logger.info("Browser agent attached to shared browser");
   }
 
   async goto(url: string): Promise<boolean> {
     try {
-      if (!this.page) throw new Error("Browser not initialized");
+      if (!this.page) {
+        throw new Error("Browser not initialized");
+      }
 
-      logger.info(`Navigating to: ${url}`);
-      await this.page.goto(url, { waitUntil: "networkidle", timeout: config.browser.timeout });
-      logger.info("Page loaded successfully");
+      await this.page.goto(url, {
+        waitUntil: "domcontentloaded",
+        timeout: this.runtimeConfig.browser.timeout,
+      });
       return true;
     } catch (error) {
-      logger.error(`Failed to navigate to ${url}:`, error);
+      logger.warn(`Failed to navigate to ${url}`, { error });
       return false;
     }
   }
 
   async getPageContent(): Promise<string> {
-    if (!this.page) throw new Error("Browser not initialized");
+    if (!this.page) {
+      throw new Error("Browser not initialized");
+    }
+
     return this.page.content();
   }
 
   async extractText(selector: string): Promise<string> {
-    try {
-      if (!this.page) throw new Error("Browser not initialized");
-      const text = await this.page.textContent(selector);
-      return text || "";
-    } catch (error) {
-      logger.warn(`Failed to extract text from ${selector}:`, error);
-      return "";
+    if (!this.page) {
+      throw new Error("Browser not initialized");
     }
+
+    const text = await this.page.locator(selector).first().textContent().catch(() => "");
+    return text?.trim() ?? "";
   }
 
-  /**
-   * Find all forms on page
-   */
   async findForms(): Promise<Form[]> {
-    try {
-      if (!this.page) throw new Error("Browser not initialized");
+    if (!this.page) {
+      throw new Error("Browser not initialized");
+    }
 
-      const forms: Form[] = [];
-      const formElements = await this.page.locator("form").all();
+    const forms = await this.page.evaluate((): EvaluatedForm[] => {
+      const normalize = (value: string | null | undefined): string | undefined => {
+        const trimmed = value?.replace(/\s+/g, " ").trim();
+        return trimmed ? trimmed : undefined;
+      };
 
-      for (let i = 0; i < formElements.length; i++) {
-        const form = formElements[i];
-        const fields: FormField[] = [];
-
-        // Get all input fields
-        const inputs = await form.locator("input").all();
-        for (const input of inputs) {
-          const name = await input.getAttribute("name");
-          const type = (await input.getAttribute("type")) || "text";
-          const required = (await input.getAttribute("required")) !== null;
-          const label = await this.getFieldLabel(name || "");
-
-          fields.push({
-            name: name || `field_${i}`,
-            type: type as any,
-            required,
-            label,
-          });
+      const buildSelector = (element: Element): string | undefined => {
+        if (element.id) {
+          return `#${CSS.escape(element.id)}`;
         }
 
-        // Get all textareas
-        const textareas = await form.locator("textarea").all();
-        for (const textarea of textareas) {
-          const name = await textarea.getAttribute("name");
-          const required = (await textarea.getAttribute("required")) !== null;
-          const label = await this.getFieldLabel(name || "");
-
-          fields.push({
-            name: name || `textarea_${i}`,
-            type: "textarea",
-            required,
-            label,
-          });
+        const name = element.getAttribute("name");
+        const tagName = element.tagName.toLowerCase();
+        if (name) {
+          return `${tagName}[name="${CSS.escape(name)}"]`;
         }
 
-        // Get all selects
-        const selects = await form.locator("select").all();
-        for (const select of selects) {
-          const name = await select.getAttribute("name");
-          const required = (await select.getAttribute("required")) !== null;
-          const label = await this.getFieldLabel(name || "");
-          const options = await select.locator("option").allTextContents();
+        return undefined;
+      };
 
-          fields.push({
-            name: name || `select_${i}`,
-            type: "select",
-            required,
-            label,
-            options,
-          });
-        }
-
-        forms.push({
-          id: `form_${i}`,
-          fields,
-          submitButtonSelector: (await form.locator('button[type="submit"], input[type="submit"]').first().isVisible())
-            ? (await form.locator('button[type="submit"], input[type="submit"]').first().getAttribute("class")) || undefined
-            : undefined,
-        });
-      }
-
-      logger.info(`Found ${forms.length} forms on page`);
-      return forms;
-    } catch (error) {
-      logger.error("Failed to find forms:", error);
-      return [];
-    }
-  }
-
-  /**
-   * Get label for form field
-   */
-  private async getFieldLabel(fieldName: string): Promise<string | undefined> {
-    try {
-      if (!this.page) return undefined;
-      const label = await this.page.locator(`label[for="${fieldName}"]`).textContent();
-      return label || undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
-   * Fill a text field
-   */
-  async fillField(selector: string, value: string, delay: number = 50): Promise<boolean> {
-    try {
-      if (!this.page) throw new Error("Browser not initialized");
-
-      logger.debug(`Filling field ${selector} with value: ${value.substring(0, 50)}...`);
-      await this.page.locator(selector).fill(value);
-
-      // Simulate human typing with small delay
-      if (delay > 0) {
-        await this.page.waitForTimeout(delay);
-      }
-
-      return true;
-    } catch (error) {
-      logger.warn(`Failed to fill field ${selector}:`, error);
-      return false;
-    }
-  }
-
-  /**
-   * Click an element
-   */
-  async click(selector: string): Promise<boolean> {
-    try {
-      if (!this.page) throw new Error("Browser not initialized");
-
-      logger.debug(`Clicking element: ${selector}`);
-      await this.page.locator(selector).click();
-      await this.page.waitForTimeout(config.browser.slowMo);
-      return true;
-    } catch (error) {
-      logger.warn(`Failed to click ${selector}:`, error);
-      return false;
-    }
-  }
-
-  /**
-   * Select option from dropdown
-   */
-  async selectOption(selector: string, value: string): Promise<boolean> {
-    try {
-      if (!this.page) throw new Error("Browser not initialized");
-
-      logger.debug(`Selecting ${value} from ${selector}`);
-      await this.page.locator(selector).selectOption(value);
-      await this.page.waitForTimeout(config.browser.slowMo);
-      return true;
-    } catch (error) {
-      logger.warn(`Failed to select option from ${selector}:`, error);
-      return false;
-    }
-  }
-
-  /**
-   * Upload file
-   */
-  async uploadFile(selector: string, filePath: string): Promise<boolean> {
-    try {
-      if (!this.page) throw new Error("Browser not initialized");
-
-      logger.info(`Uploading file: ${filePath} to ${selector}`);
-      const fileInput = this.page.locator(selector).first();
-
-      // Check if element exists
-      if (!(await fileInput.isVisible({ timeout: 5000 }))) {
-        // Try to find in iframes
-        const frames = this.page.frames();
-        for (const frame of frames) {
-          const frameFileInput = frame.locator(selector).first();
-          if (await frameFileInput.isVisible({ timeout: 5000 })) {
-            await frameFileInput.setInputFiles(filePath);
-            logger.info("File uploaded from iframe");
-            return true;
+      const getInlineLabel = (element: Element): string | undefined => {
+        const id = element.getAttribute("id");
+        if (id) {
+          const explicitLabel = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+          const explicitText = normalize(explicitLabel?.textContent);
+          if (explicitText) {
+            return explicitText;
           }
         }
+
+        const wrappedLabel = element.closest("label");
+        const wrappedText = normalize(wrappedLabel?.textContent);
+        if (wrappedText) {
+          return wrappedText;
+        }
+
+        const ariaLabel = normalize(element.getAttribute("aria-label"));
+        if (ariaLabel) {
+          return ariaLabel;
+        }
+
+        return normalize(element.getAttribute("placeholder"));
+      };
+
+      const mapInputType = (inputType: string | null): EvaluatedFormField["type"] | null => {
+        const normalized = (inputType ?? "text").toLowerCase();
+        switch (normalized) {
+          case "email":
+          case "tel":
+          case "file":
+          case "number":
+          case "date":
+          case "checkbox":
+          case "radio":
+            return normalized;
+          case "text":
+          case "search":
+          case "url":
+          case "password":
+            return "text";
+          case "hidden":
+          case "submit":
+          case "button":
+          case "reset":
+            return null;
+          default:
+            return "text";
+        }
+      };
+
+      return Array.from(document.querySelectorAll("form")).map((formElement, formIndex) => {
+        const fields: EvaluatedFormField[] = [];
+        const interactiveElements = Array.from(
+          formElement.querySelectorAll("input, textarea, select"),
+        );
+
+        for (const element of interactiveElements) {
+          if (element instanceof HTMLInputElement) {
+            const fieldType = mapInputType(element.type);
+            if (!fieldType) {
+              continue;
+            }
+
+            fields.push({
+              name: normalize(element.name) ?? `input_${formIndex}_${fields.length}`,
+              type: fieldType,
+              label: getInlineLabel(element),
+              required: element.required || element.getAttribute("aria-required") === "true",
+              selector: buildSelector(element),
+            });
+            continue;
+          }
+
+          if (element instanceof HTMLTextAreaElement) {
+            fields.push({
+              name: normalize(element.name) ?? `textarea_${formIndex}_${fields.length}`,
+              type: "textarea",
+              label: getInlineLabel(element),
+              required: element.required || element.getAttribute("aria-required") === "true",
+              selector: buildSelector(element),
+            });
+            continue;
+          }
+
+          if (element instanceof HTMLSelectElement) {
+            fields.push({
+              name: normalize(element.name) ?? `select_${formIndex}_${fields.length}`,
+              type: "select",
+              label: getInlineLabel(element),
+              required: element.required || element.getAttribute("aria-required") === "true",
+              options: Array.from(element.options)
+                .map((option) => normalize(option.textContent))
+                .filter((option): option is string => Boolean(option)),
+              selector: buildSelector(element),
+            });
+          }
+        }
+
+        const submitButton = formElement.querySelector(
+          "button[type='submit'], input[type='submit']",
+        );
+
+        return {
+          id: formElement.id || `form_${formIndex}`,
+          fields,
+          submitButtonSelector: submitButton ? buildSelector(submitButton) : undefined,
+        };
+      });
+    });
+
+    logger.info(`Detected ${forms.length} form(s) on page`);
+    return forms;
+  }
+
+  async fillField(selector: string, value: string): Promise<boolean> {
+    try {
+      if (!this.page) {
+        throw new Error("Browser not initialized");
       }
 
-      await fileInput.setInputFiles(filePath);
-      logger.info("File uploaded successfully");
+      await this.page.locator(selector).first().fill(value);
+      await this.page.waitForTimeout(this.runtimeConfig.browser.slowMo);
       return true;
     } catch (error) {
-      logger.warn(`Failed to upload file to ${selector}:`, error);
+      logger.warn(`Failed to fill selector ${selector}`, { error });
       return false;
     }
   }
 
-  /**
-   * Scroll page
-   */
-  async scroll(direction: "down" | "up" = "down", amount: number = 3): Promise<void> {
-    if (!this.page) throw new Error("Browser not initialized");
+  async click(selector: string): Promise<boolean> {
+    try {
+      if (!this.page) {
+        throw new Error("Browser not initialized");
+      }
 
-    // Use page's native scroll method
-    await this.page.keyboard.down("End");
-    await this.page.waitForTimeout(500);
+      await this.page.locator(selector).first().click();
+      await this.page.waitForTimeout(this.runtimeConfig.browser.slowMo);
+      return true;
+    } catch (error) {
+      logger.warn(`Failed to click selector ${selector}`, { error });
+      return false;
+    }
   }
 
-  /**
-   * Wait for element
-   */
+  async selectOption(selector: string, value: string): Promise<boolean> {
+    try {
+      if (!this.page) {
+        throw new Error("Browser not initialized");
+      }
+
+      await this.page.locator(selector).first().selectOption({ label: value }).catch(async () => {
+        await this.page?.locator(selector).first().selectOption(value);
+      });
+      await this.page.waitForTimeout(this.runtimeConfig.browser.slowMo);
+      return true;
+    } catch (error) {
+      logger.warn(`Failed to select option on ${selector}`, { error });
+      return false;
+    }
+  }
+
+  async uploadFile(selector: string, filePath: string): Promise<boolean> {
+    try {
+      if (!this.page) {
+        throw new Error("Browser not initialized");
+      }
+
+      await this.page.locator(selector).first().setInputFiles(filePath);
+      return true;
+    } catch (error) {
+      logger.warn(`Failed to upload file for selector ${selector}`, { error });
+      return false;
+    }
+  }
+
+  async scroll(direction: "down" | "up" = "down", amount: number = 300): Promise<void> {
+    if (!this.page) {
+      throw new Error("Browser not initialized");
+    }
+
+    await this.page.evaluate(
+      ({ dir, px }) => {
+        window.scrollBy(0, dir === "down" ? px : -px);
+      },
+      { dir: direction, px: amount },
+    );
+  }
+
   async waitForElement(selector: string, timeout: number = 5000): Promise<boolean> {
     try {
-      if (!this.page) throw new Error("Browser not initialized");
-      await this.page.locator(selector).waitFor({ timeout });
+      if (!this.page) {
+        throw new Error("Browser not initialized");
+      }
+
+      await this.page.locator(selector).first().waitFor({ timeout });
       return true;
     } catch {
       return false;
     }
   }
 
-  /**
-   * Get current URL
-   */
   async getCurrentUrl(): Promise<string> {
-    if (!this.page) throw new Error("Browser not initialized");
+    if (!this.page) {
+      throw new Error("Browser not initialized");
+    }
+
     return this.page.url();
   }
 
-  /**
-   * Take screenshot for debugging
-   */
   async screenshot(filename: string): Promise<void> {
-    try {
-      if (!this.page) throw new Error("Browser not initialized");
-      await this.page.screenshot({ path: `./data/screenshots/${filename}` });
-      logger.info(`Screenshot saved: ${filename}`);
-    } catch (error) {
-      logger.warn(`Failed to take screenshot:`, error);
+    if (!this.page) {
+      throw new Error("Browser not initialized");
     }
+
+    await this.page.screenshot({ path: `./data/screenshots/${filename}` });
   }
 
-  /**
-   * Close browser
-   */
   async close(): Promise<void> {
-    try {
-      if (this.browser) {
-        await this.browser.close();
-        logger.info("Browser closed");
-      }
-    } catch (error) {
-      logger.error("Failed to close browser:", error);
-    }
+    await this.browserLifecycleManager.closePage(this.page);
+    await this.browserLifecycleManager.closeContext(this.context);
+    this.page = null;
+    this.context = null;
   }
 }
-
-export default BrowserAgent;

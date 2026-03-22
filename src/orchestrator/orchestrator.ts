@@ -1,318 +1,212 @@
-import PlannerAgent from "../agents/planner-agent";
-import ExecutorAgent from "../agents/executor-agent";
-import MemoryManager from "../memory/memory-manager";
-import logger from "../utils/logger";
-import { AgentState, JobDescription, OrchestratorState } from "../types/index";
-import { config } from "../config/index";
+import { config, type Config } from "../config/index";
+import { jobListingToDescription } from "../integrations/job-scraper";
+import { MemoryManager } from "../memory/memory-manager";
+import {
+  AgentState,
+  type ApplicationRecord,
+  type JobListing,
+  type OrchestratorState,
+} from "../types/index";
+import { logger } from "../utils/logger";
+import { ExecutorAgent } from "../agents/executor-agent";
+import { PlannerAgent } from "../agents/planner-agent";
 
-/**
- * Main Orchestrator:
- * Controls the overall workflow loop: SEARCH → ANALYZE → PLAN → ACT → VERIFY → LEARN
- */
 export class JobApplicationOrchestrator {
-  private planner: PlannerAgent;
-  private executor: ExecutorAgent;
-  private memory: MemoryManager;
-  private state: OrchestratorState;
+  private readonly state: OrchestratorState = {
+    currentState: AgentState.IDLE,
+    currentJob: null,
+    currentPlan: null,
+    currentApplicationId: null,
+    startTime: Date.now(),
+    stepCount: 0,
+    historicalData: [],
+  };
 
-  constructor() {
-    this.planner = new PlannerAgent();
-    this.executor = new ExecutorAgent();
-    this.memory = new MemoryManager();
-    this.state = {
-      currentState: AgentState.IDLE,
-      currentJob: null,
-      currentPlan: null,
-      currentApplicationId: null,
-      startTime: Date.now(),
-      stepCount: 0,
-      historicalData: [],
-    };
-  }
+  constructor(
+    private readonly planner: PlannerAgent,
+    private readonly executor: ExecutorAgent,
+    private readonly memory: MemoryManager,
+    private readonly runtimeConfig: Config = config,
+  ) {}
 
-  /**
-   * Initialize orchestrator
-   */
   async initialize(): Promise<void> {
-    try {
-      logger.info("Initializing Job Application Orchestrator...");
-
-      // Initialize memory
-      await this.memory.initialize();
-
-      // Check Ollama availability
-      logger.info("Checking Ollama availability...");
-      // Will be checked on first use
-
-      // Load historical data
-      this.state.historicalData = await this.memory.getApplicationHistory(100);
-      logger.info(`Loaded ${this.state.historicalData.length} historical applications`);
-
-      logger.info("Orchestrator initialized successfully");
-    } catch (error) {
-      logger.error("Failed to initialize orchestrator:", error);
-      throw error;
-    }
+    await this.memory.initialize();
+    logger.info("Orchestrator initialized with PostgreSQL MemoryManager");
   }
 
-  /**
-   * Process a single job
-   * This is the main workflow: ANALYZE → PLAN → ACT → VERIFY → LEARN
-   */
-  async processJob(jobUrl: string, jobDescription: JobDescription): Promise<void> {
+  async processJob(job: JobListing): Promise<void> {
+    const jobDescription = jobListingToDescription(job);
+    this.state.currentJob = job;
+    this.state.currentApplicationId = this.generateApplicationId();
+    this.state.currentPlan = null;
+    this.state.currentState = AgentState.ANALYZING;
+    this.state.stepCount = 0;
+
+    logger.info(`Processing ${job.title} at ${job.company}`, {
+      portalSource: job.portalSource,
+      url: job.url,
+    });
+
     try {
-      this.state.currentJob = jobDescription;
-      this.state.currentApplicationId = this.generateApplicationId();
-      this.state.stepCount = 0;
-
-      logger.info(`\n${"=".repeat(60)}`);
-      logger.info(`Processing Job: ${jobDescription.jobTitle} @ ${jobDescription.companyName}`);
-      logger.info(`URL: ${jobUrl}`);
-      logger.info(`${"=".repeat(60)}\n`);
-
-      // STEP 1: ANALYZE - Check if already applied
-      this.state.currentState = AgentState.ANALYZING;
-      const alreadyApplied = await this.memory.hasAppliedBefore(jobUrl);
-      if (alreadyApplied) {
-        logger.info("Already applied to this job. Skipping.");
+      if (await this.memory.hasAppliedBefore(job.url)) {
+        logger.info(`Skipping ${job.url} because it already has an application record`);
         return;
       }
 
-      const isRejected = await this.memory.isJobRejected(jobUrl);
-      if (isRejected) {
-        logger.info("Job was previously rejected. Skipping.");
+      if (await this.memory.isJobRejected(job.url)) {
+        logger.info(`Skipping ${job.url} because it was previously rejected`);
         return;
       }
 
-      // STEP 2: ANALYZE - Analyze relevance
-      this.state.stepCount++;
-      const relevancy = await this.planner.analyzeRelevance(jobDescription);
+      // Ensure job is in DB
+      const jobId = await this.memory.storeJobListing(job);
 
-      if (!relevancy.isRelevant || relevancy.relevanceScore < 30) {
-        logger.warn(`Job not relevant (score: ${relevancy.relevanceScore}%). Rejecting.`);
-        logger.info(`Reason: ${relevancy.reasoning}`);
+      const relevancy = await this.withRetry("relevance analysis", () =>
+        this.planner.analyzeRelevance(jobDescription),
+      );
 
-        await this.memory.recordRejectedJob(
-          jobUrl,
-          jobDescription.companyName || "Unknown",
-          relevancy.reasoning,
-        );
+      await this.memory.logEvent(jobId, 'ANALYZED', `Relevancy Score: ${relevancy.relevanceScore}`, { relevancy });
 
+      if (!relevancy.isRelevant || relevancy.relevanceScore < 30 || relevancy.visaSponsorshipScore < 6) {
+        await this.memory.logEvent(jobId, 'REJECTED', `Rejected by planner: ${relevancy.reasoning}`);
+        logger.info(`Rejected job ${job.url}`, {
+          relevanceScore: relevancy.relevanceScore,
+          visaSponsorshipScore: relevancy.visaSponsorshipScore,
+        });
         return;
       }
 
-      logger.info(`✓ Job is relevant (score: ${relevancy.relevanceScore}%)`);
-      logger.info(`  Matched criteria: ${relevancy.criteriaMatched.join(", ")}`);
-
-      // STEP 3: PLAN - Create application strategy
       this.state.currentState = AgentState.PLANNING;
-      this.state.stepCount++;
-      const plan = await this.planner.planApplication(jobDescription);
+      this.state.stepCount += 1;
+      const plan = await this.withRetry("application planning", () =>
+        this.planner.planApplication(jobDescription),
+      );
+      this.state.currentPlan = plan;
+
+      await this.memory.logEvent(jobId, 'PLANNED', `Planned application strategy`);
 
       if (!plan.shouldApply) {
-        logger.info("Plan decided not to apply. Rejecting.");
-        await this.memory.recordRejectedJob(
-          jobUrl,
-          jobDescription.companyName || "Unknown",
-          "Planning phase decided not to apply",
-        );
+        await this.memory.logEvent(jobId, 'REJECTED', "Planning stage recommended skipping");
+        logger.info(`Skipped ${job.url} because the application plan marked it as not worth applying`);
         return;
       }
 
-      logger.info(`✓ Application plan created`);
-      logger.info(`  - Estimated fill time: ${plan.estimatedFillTime}s`);
-      logger.info(`  - Key practices to highlight: ${plan.keyPracticesToHighlight.join(", ")}`);
-
-      // STEP 4: ACT - Execute the application
       this.state.currentState = AgentState.EXECUTING;
-      this.state.stepCount++;
-      const executionResult = await this.executor.executeApplication(jobUrl, jobDescription);
+      this.state.stepCount += 1;
+      const executionResult = await this.executor.executeApplication(job.url, jobDescription);
 
       if (!executionResult.success) {
-        logger.error(`✗ Application execution failed`);
-        logger.error(`  Errors: ${executionResult.errors.join("; ")}`);
-
-        // Record failed attempt
-        await this.memory.recordApplication({
-          companyName: jobDescription.companyName || "Unknown",
-          jobTitle: jobDescription.jobTitle || "Unknown",
-          jobUrl,
-          status: "failed",
-          relevanceScore: relevancy.relevanceScore,
-          notes: `Execution failed: ${executionResult.errors[0]}`,
-          formDataFilled: executionResult.filledFields,
-          errorLog: executionResult.errors.join("\n"),
-        });
-
+        await this.memory.logEvent(jobId, 'FAILED', executionResult.message, { errors: executionResult.errors });
         return;
       }
 
-      // STEP 5: VERIFY - Check form completion
       this.state.currentState = AgentState.VERIFYING;
-      this.state.stepCount++;
+      this.state.stepCount += 1;
 
-      const fillRate = Math.round((Object.keys(executionResult.filledFields).length / 10) * 100); // Estimate based on fields filled
+      // Fix BUG 2: Hardcoded fill rate denominator
+      const totalFields = executionResult.totalFields || Object.keys(executionResult.filledFields).length;
+      const fillRate = totalFields === 0 ? 0 : Math.round((Object.keys(executionResult.filledFields).length / totalFields) * 100);
       const isComplete = fillRate >= 70;
 
-      logger.info(`✓ Form processing completed`);
-      logger.info(`  - Fields filled: ${Object.keys(executionResult.filledFields).length}`);
-      logger.info(`  - Completion rate: ${fillRate}%`);
-
-      if (!isComplete) {
-        logger.warn("Form completion below 70% threshold");
-      }
-
-      // Record successful application attempt
-      const applicationRecord = await this.memory.recordApplication({
-        companyName: jobDescription.companyName || "Unknown",
-        jobTitle: jobDescription.jobTitle || "Unknown",
-        jobUrl,
-        status: isComplete ? "applied" : "pending",
-        relevanceScore: relevancy.relevanceScore,
-        fillRating: fillRate,
-        notes: executionResult.message,
+      await this.memory.logEvent(jobId, 'APPLIED', executionResult.message, {
+        fillRate,
+        isComplete,
         formDataFilled: executionResult.filledFields,
       });
 
-      // STEP 6: LEARN - Extract insights for future applications
       this.state.currentState = AgentState.LEARNING;
-      this.state.stepCount++;
-      await this.learnFromApplication(applicationRecord);
+      this.state.stepCount += 1;
+      await this.learnFromApplication(job.company);
 
-      logger.info(`\n${"=".repeat(60)}`);
-      logger.info(`✓ Job application process completed`);
-      logger.info(`  - Application ID: ${applicationRecord.id}`);
-      logger.info(`  - Status: ${applicationRecord.status}`);
-      logger.info(`  - Relevance Score: ${applicationRecord.relevanceScore}%`);
-      logger.info(`${"=".repeat(60)}\n`);
+      logger.info(`Completed processing for ${job.title}`, {
+        url: job.url,
+        status: isComplete ? "applied" : "pending",
+        fillRate,
+      });
     } catch (error) {
-      logger.error("Error processing job:", error);
       this.state.currentState = AgentState.ERROR;
+      logger.error("Unexpected orchestrator failure while processing job", { error, url: job.url });
     }
   }
 
-  /**
-   * Learn from completed applications
-   */
-  private async learnFromApplication(applicationRecord: any): Promise<void> {
+  async processJobs(jobs: JobListing[]): Promise<void> {
+    const limit = Math.min(jobs.length, this.runtimeConfig.search.maxApplicationsPerRun);
+    logger.info(`Processing ${limit} job(s) out of ${jobs.length} discovered`);
+
+    const keywords = this.runtimeConfig.search.searchTerms?.join(", ") ?? "java developer";
+    const location = this.runtimeConfig.search.targetCountry ?? "Australia";
+    
+    await this.memory.startRun(keywords, location);
+
     try {
-      logger.info("Analyzing application for learning...");
+      for (let index = 0; index < limit; index += 1) {
+        await this.processJob(jobs[index]);
 
-      // Update memory with statistics
-      const stats = await this.memory.getStatistics();
-
-      logger.info("Updated statistics:");
-      logger.info(`  - Total applications: ${stats.totalApplications}`);
-      logger.info(`  - Successful: ${stats.appliedCount}`);
-      logger.info(`  - Failed: ${stats.failedCount}`);
-      logger.info(`  - Success rate: ${stats.successRate.toFixed(2)}%`);
-
-      // Could implement ML-based learning here in future
-      // For now, just track patterns
-    } catch (error) {
-      logger.error("Error learning from application:", error);
-    }
-  }
-
-  /**
-   * Process multiple jobs
-   */
-  async processJobs(jobs: Array<{ url: string; description: JobDescription }>): Promise<void> {
-    try {
-      logger.info(`Starting batch processing of ${jobs.length} jobs`);
-
-      for (let i = 0; i < jobs.length && i < config.search.maxJobsToApply; i++) {
-        logger.info(`\nProcessing job ${i + 1}/${Math.min(jobs.length, config.search.maxJobsToApply)}`);
-
-        await this.processJob(jobs[i].url, jobs[i].description);
-
-        // Small delay between applications
-        if (i < jobs.length - 1) {
-          logger.info("Waiting before next job...");
-          await this.delay(2000); // 2 second delay
+        if (index < limit - 1) {
+          await this.delay(1_500);
         }
       }
-
-      // Print final summary
-      await this.printSummary();
-    } catch (error) {
-      logger.error("Error processing jobs:", error);
+      await this.memory.endRun("COMPLETED");
+    } catch (e) {
+      await this.memory.endRun("FAILED");
+      throw e;
     }
+
+    await this.printSummary();
   }
 
-  /**
-   * Search for jobs (simulated - would integrate with real job boards)
-   */
-  async searchJobs(query: string): Promise<Array<{ url: string; description: JobDescription }>> {
-    try {
-      logger.info(`Searching for jobs: "${query}"`);
-
-      // This is a stub - in production, this would:
-      // 1. Use job board APIs or web scraping
-      // 2. Parse job listings
-      // 3. Extract job descriptions
-
-      const jobs: Array<{ url: string; description: JobDescription }> = [];
-
-      // For testing, we'll need manual job URLs or integration with job boards
-      logger.info("Job search completed (stub implementation)");
-
-      return jobs;
-    } catch (error) {
-      logger.error("Error searching jobs:", error);
-      return [];
-    }
-  }
-
-  /**
-   * Print application summary
-   */
-  private async printSummary(): Promise<void> {
-    try {
-      const stats = await this.memory.getStatistics();
-
-      console.log("\n" + "=".repeat(60));
-      console.log("ORCHESTRATOR SUMMARY");
-      console.log("=".repeat(60));
-      console.log(
-        `Total Applications: ${stats.totalApplications} | Applied: ${stats.appliedCount} | Failed: ${stats.failedCount}`,
-      );
-      console.log(`Unique Companies: ${stats.uniqueCompanies}`);
-      console.log(`Success Rate: ${stats.successRate.toFixed(2)}%`);
-      console.log(`Session Duration: ${Math.round((Date.now() - this.state.startTime) / 1000)}s`);
-      console.log("=".repeat(60) + "\n");
-    } catch (error) {
-      logger.error("Error printing summary:", error);
-    }
-  }
-
-  /**
-   * Get current state
-   */
   getState(): OrchestratorState {
     return this.state;
   }
 
-  /**
-   * Cleanup
-   */
   async cleanup(): Promise<void> {
-    try {
-      await this.memory.close();
-      logger.info("Orchestrator cleanup completed");
-    } catch (error) {
-      logger.error("Error during cleanup:", error);
-    }
+    await this.memory.close();
   }
 
-  // Utility
+  private async learnFromApplication(companyName: string): Promise<void> {
+    const stats = await this.memory.getStatistics();
+    logger.info(`Learning checkpoint for ${companyName}`, {
+      totalApplications: stats.totalApplications,
+      appliedCount: stats.appliedCount,
+      failedCount: stats.failedCount,
+      successRate: stats.successRate,
+    });
+  }
+
+  private async printSummary(): Promise<void> {
+    const stats = await this.memory.getStatistics();
+    logger.info("Orchestrator summary", {
+      totalApplications: stats.totalApplications,
+      appliedCount: stats.appliedCount,
+      failedCount: stats.failedCount,
+      uniqueCompanies: stats.uniqueCompanies,
+      successRate: stats.successRate,
+      sessionDurationSeconds: Math.round((Date.now() - this.state.startTime) / 1000),
+    });
+  }
+
+  private async withRetry<T>(operationName: string, operation: () => Promise<T>): Promise<T> {
+    for (let attempt = 1; attempt <= this.runtimeConfig.agent.maxRetries; attempt += 1) {
+      try {
+        return await operation();
+      } catch (error) {
+        logger.warn(`${operationName} attempt ${attempt} failed`, { error });
+        if (attempt === this.runtimeConfig.agent.maxRetries) {
+          throw error;
+        }
+
+        await this.delay(1000 * attempt);
+      }
+    }
+
+    throw new Error(`${operationName} failed unexpectedly`);
+  }
+
   private delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   private generateApplicationId(): string {
-    return `app_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    return `app_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   }
 }
-
-export default JobApplicationOrchestrator;

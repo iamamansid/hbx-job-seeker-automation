@@ -1,451 +1,160 @@
-import { Browser, Page } from "playwright";
-import { chromium } from "playwright";
-import { JobDescription } from "../types/index";
-import logger from "../utils/logger";
+import type { BrowserContext, BrowserContextOptions, Page } from "playwright";
 
-/**
- * Job Scraper - Fetches job listings from job boards and parses them
- * Supports: Seek.com.au, LinkedIn, Indeed
- */
-class JobScraper {
-  private browser: Browser | null = null;
-  private page: Page | null = null;
+import { config, type Config } from "../config/index";
+import { BrowserLifecycleManager } from "../browser/browser-lifecycle-manager";
+import {
+  JobDescriptionSchema,
+  JobListingSchema,
+  type JobDescription,
+  type JobListing,
+  type JobScraper,
+  type PortalSource,
+} from "../types/index";
+import { logger } from "../utils/logger";
 
-  /**
-   * Initialize the scraper by launching a browser
-   */
-  async initialize(): Promise<void> {
+export abstract class BaseJobScraper implements JobScraper {
+  protected readonly visaKeywords = [
+    "visa sponsorship",
+    "482 visa",
+    "willing to sponsor",
+    "sponsor overseas",
+    "visa support",
+    "overseas applicants welcome",
+  ];
+
+  constructor(
+    protected readonly browserLifecycleManager: BrowserLifecycleManager,
+    protected readonly runtimeConfig: Config = config,
+  ) {}
+
+  abstract searchJobs(keywords: string[], location: string, maxPages: number): Promise<JobListing[]>;
+
+  abstract extractJobDetails(url: string): Promise<JobListing>;
+
+  protected async withPage<T>(
+    action: (page: Page, context: BrowserContext) => Promise<T>,
+    contextOptions: BrowserContextOptions = {},
+  ): Promise<T> {
+    const { context, page } = await this.browserLifecycleManager.createPage(contextOptions);
     try {
-      this.browser = await chromium.launch({ headless: true });
-      logger.info("Job Scraper initialized");
-    } catch (error) {
-      logger.error("Failed to initialize scraper:", error);
-      throw error;
+      return await action(page, context);
+    } finally {
+      await this.browserLifecycleManager.closePage(page);
+      await this.browserLifecycleManager.closeContext(context);
     }
   }
 
-  /**
-   * Search for jobs on Seek.com.au
-   * @param jobTitle - Job title to search (e.g., "Java Developer")
-   * @param location - Job location (e.g., "Australia")
-   * @param maxResults - Maximum number of results to fetch
-   */
-  async searchSeekAustralia(
-    jobTitle: string = "Java Developer",
-    location: string = "Australia",
-    maxResults: number = 5
-  ): Promise<JobDescription[]> {
-    const jobs: JobDescription[] = [];
+  protected async navigate(page: Page, url: string): Promise<void> {
+    logger.info(`Navigating to ${url}`);
+    await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: this.runtimeConfig.browser.timeout,
+    });
+  }
 
-    try {
-      if (!this.browser) {
-        await this.initialize();
-      }
-
-      this.page = await this.browser!.newPage();
-
-      // Search on Seek.com.au
-      const searchUrl = `https://www.seek.com.au/${jobTitle.replace(
-        / /g,
-        "-"
-      )}-jobs?where=${location.replace(/ /g, "")}`;
-
-      logger.info(
-        `Searching Seek.com.au for "${jobTitle}" in "${location}"...`
-      );
-      await this.page.goto(searchUrl, { waitUntil: "networkidle" });
-
-      // Extract job listings
-      const jobElements = await this.page.locator(
-        '[data-automation="searchResultsSection"] article'
-      );
-      const count = await jobElements.count();
-
-      logger.info(`Found ${count} job listings`);
-
-      for (let i = 0; i < Math.min(count, maxResults); i++) {
-        try {
-          const element = jobElements.nth(i);
-
-          // Extract job details
-          const titleElement = await element
-            .locator('[data-automation="jobTitle"]')
-            .first();
-          const jobTitle = await titleElement.textContent();
-
-          const companyElement = await element
-            .locator('[data-automation="companyName"]')
-            .first();
-          const company = await companyElement.textContent();
-
-          const locationElement = await element
-            .locator('[data-automation="jobLocation"]')
-            .first();
-          const jobLocation = await locationElement.textContent();
-
-          const descriptionElement = await element
-            .locator('[data-automation="jobSnippet"]')
-            .first();
-          const description = await descriptionElement.textContent();
-
-          // Extract salary if available
-          const salaryElement = await element
-            .locator('[data-automation="jobSalary"]')
-            .first();
-          const salary = await salaryElement
-            .textContent()
-            .catch(() => "Not specified");
-
-          // Extract job URL
-          const linkElement = await element
-            .locator('[data-automation="jobTitle"]')
-            .first();
-          const jobUrl = await linkElement
-            .getAttribute("href")
-            .catch(() => "");
-
-          if (jobTitle && company && jobLocation) {
-            const jobDesc: JobDescription = {
-              jobTitle: jobTitle.trim(),
-              companyName: company.trim(),
-              location: jobLocation.trim(),
-              workType: "Full-time",
-              requirements: this.parseRequirements(description || ""),
-              responsibilities: this.parseResponsibilities(description || ""),
-              benefits: ["Competitive salary", "Professional growth"],
-              fullDescription: description?.trim() || "",
-              salaryRange: salary?.trim() || "Not specified",
-              url: jobUrl || "",
-            };
-
-            jobs.push(jobDesc);
-            logger.info(`  ✓ ${jobTitle?.trim()} at ${company?.trim()}`);
-          }
-        } catch (error) {
-          logger.warn(`Failed to parse job listing ${i}:`, error);
-          continue;
-        }
-      }
-
-      await this.page.close();
-    } catch (error) {
-      logger.error("Error searching Seek.com.au:", error);
-      if (this.page) {
-        await this.page.close();
-      }
+  protected toAbsoluteUrl(baseUrl: string, href: string | null | undefined): string {
+    if (!href) {
+      return "";
     }
 
-    return jobs;
-  }
-
-  /**
-   * Search for jobs on LinkedIn
-   * @param jobTitle - Job title to search
-   * @param location - Job location
-   * @param maxResults - Maximum number of results
-   */
-  async searchLinkedIn(
-    jobTitle: string = "Java Developer",
-    location: string = "Australia",
-    maxResults: number = 5
-  ): Promise<JobDescription[]> {
-    const jobs: JobDescription[] = [];
-
     try {
-      if (!this.browser) {
-        await this.initialize();
-      }
-
-      this.page = await this.browser!.newPage();
-
-      // LinkedIn search URL
-      const searchUrl = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(
-        jobTitle
-      )}&location=${encodeURIComponent(location)}`;
-
-      logger.info(`Searching LinkedIn for "${jobTitle}" in "${location}"...`);
-      await this.page.goto(searchUrl, { waitUntil: "networkidle" });
-
-      // LinkedIn has strict bot detection, so we'll use a mock response for now
-      logger.warn(
-        "LinkedIn requires authentication. Using generated sample data instead."
-      );
-
-      // Return sample LinkedIn-style jobs
-      jobs.push(this.generateSampleLinkedInJob(jobTitle, location, 1));
-      jobs.push(this.generateSampleLinkedInJob(jobTitle, location, 2));
-      jobs.push(this.generateSampleLinkedInJob(jobTitle, location, 3));
-
-      await this.page.close();
-    } catch (error) {
-      logger.error("Error searching LinkedIn:", error);
-      if (this.page) {
-        await this.page.close();
-      }
+      return new URL(href, baseUrl).toString();
+    } catch {
+      return href;
     }
-
-    return jobs;
   }
 
-  /**
-   * Search for jobs on Indeed
-   * @param jobTitle - Job title to search
-   * @param location - Job location
-   * @param maxResults - Maximum number of results
-   */
-  async searchIndeed(
-    jobTitle: string = "Java Developer",
-    location: string = "Australia",
-    maxResults: number = 5
-  ): Promise<JobDescription[]> {
-    const jobs: JobDescription[] = [];
-
-    try {
-      if (!this.browser) {
-        await this.initialize();
-      }
-
-      this.page = await this.browser!.newPage();
-
-      // Indeed search URL
-      const searchUrl = `https://au.indeed.com/jobs?q=${encodeURIComponent(
-        jobTitle
-      )}&l=${encodeURIComponent(location)}`;
-
-      logger.info(`Searching Indeed for "${jobTitle}" in "${location}"...`);
-      await this.page.goto(searchUrl, { waitUntil: "networkidle" });
-
-      // Extract job listings from Indeed
-      const jobElements = await this.page.locator('div[data-job-id]');
-      const count = await jobElements.count();
-
-      logger.info(`Found ${count} job listings on Indeed`);
-
-      for (let i = 0; i < Math.min(count, maxResults); i++) {
-        try {
-          const element = jobElements.nth(i);
-
-          // Indeed job structure
-          const titleElement = await element
-            .locator('[class*="jobTitle"]')
-            .first();
-          const jobTitle = await titleElement.textContent();
-
-          const companyElement = await element
-            .locator('[data-company-name]')
-            .first();
-          const company = await companyElement.textContent();
-
-          const descriptionElement = await element
-            .locator('[class*="summary"], [class*="snippet"]')
-            .first();
-          const description = await descriptionElement.textContent();
-
-          if (jobTitle && company) {
-            const jobDesc: JobDescription = {
-              jobTitle: jobTitle.trim(),
-              companyName: company.trim(),
-              location: location,
-              workType: "Full-time",
-              requirements: this.parseRequirements(description || ""),
-              responsibilities: this.parseResponsibilities(description || ""),
-              benefits: ["Competitive salary"],
-              fullDescription: description?.trim() || "",
-              salaryRange: "Not specified",
-              url: "",
-            };
-
-            jobs.push(jobDesc);
-          }
-        } catch (error) {
-          logger.warn(`Failed to parse Indeed job ${i}:`, error);
-        }
-      }
-
-      await this.page.close();
-    } catch (error) {
-      logger.error("Error searching Indeed:", error);
-      if (this.page) {
-        await this.page.close();
-      }
-    }
-
-    return jobs;
+  protected normalizeText(value: string | null | undefined): string {
+    return value?.replace(/\s+/g, " ").trim() ?? "";
   }
 
-  /**
-   * Get sample jobs for demonstration
-   */
-  getSampleJobs(jobTitle: string, location: string): JobDescription[] {
-    return [
-      {
-        jobTitle: `${jobTitle} - Senior Role`,
-        companyName: "GlobalTech Solutions",
-        location: location,
-        workType: "Hybrid",
-        requirements: [
-          "5+ years Java experience",
-          "Spring Boot and Microservices",
-          "PostgreSQL/MongoDB",
-          "Docker and Kubernetes",
-          "REST API design",
-        ],
-        responsibilities: [
-          "Design backend systems",
-          "Lead code reviews",
-          "Mentor junior developers",
-          "Optimize database queries",
-        ],
-        benefits: ["AUD $130k-$160k", "Health insurance", "Work from home"],
-        fullDescription: `We're looking for a Senior Java Developer to join our growing team in ${location}. 
-You'll work with modern technologies like Spring Boot, microservices, and cloud platforms.`,
-        salaryRange: "AUD $130,000 - $160,000",
-        url: "https://www.globaltechsolutions.com/jobs/java-dev-1",
-      },
-      {
-        jobTitle: `${jobTitle} - Mid-Level`,
-        companyName: "CloudFirst Systems",
-        location: location,
-        workType: "Remote",
-        requirements: [
-          "3+ years Java development",
-          "Spring Framework knowledge",
-          "REST APIs",
-          "SQL databases",
-          "Git version control",
-        ],
-        responsibilities: [
-          "Develop backend features",
-          "Write unit tests",
-          "Participate in code reviews",
-          "Document code",
-        ],
-        benefits: [
-          "AUD $100k-$130k",
-          "Flexible hours",
-          "Professional development",
-        ],
-        fullDescription: `Join our dynamic team working on cloud-based solutions. We're building scalable 
-backend systems using Java and modern frameworks.`,
-        salaryRange: "AUD $100,000 - $130,000",
-        url: "https://www.cloudfirst.com/jobs/java-dev-2",
-      },
-      {
-        jobTitle: `${jobTitle} - Entry to Mid-Level`,
-        companyName: "StartupInnovations",
-        location: location,
-        workType: "Hybrid",
-        requirements: [
-          "2+ years Java experience",
-          "Object-oriented programming",
-          "API development",
-          "Database basics",
-        ],
-        responsibilities: [
-          "Build application features",
-          "Fix bugs and improve code",
-          "Learn new technologies",
-          "Contribute to team meetings",
-        ],
-        benefits: [
-          "AUD $80k-$110k",
-          "Stock options",
-          "Learning budget",
-          "Casual environment",
-        ],
-        fullDescription: `An exciting opportunity to grow your Java career at a fast-growing startup. 
-You'll work on cutting-edge projects with a supportive team.`,
-        salaryRange: "AUD $80,000 - $110,000",
-        url: "https://www.startupinnovations.com/jobs/java-dev-3",
-      },
-    ];
+  protected hasVisaSponsorshipMention(description: string): boolean {
+    const lowered = description.toLowerCase();
+    return this.visaKeywords.some((keyword) => lowered.includes(keyword));
   }
 
-  /**
-   * Parse requirements from job description
-   */
-  private parseRequirements(description: string): string[] {
-    const requirements: string[] = [];
-    const keywords = [
+  protected parseResponsibilities(description: string): string[] {
+    const lines = description
+      .split(/\n|•|·|-/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 20);
+    return lines.slice(0, 8);
+  }
+
+  protected parseRequirements(description: string): string[] {
+    const patterns = [
       "java",
-      "spring",
+      "spring boot",
       "microservices",
-      "rest api",
-      "postgresql",
-      "mongodb",
+      "rest",
+      "azure",
+      "gcp",
       "docker",
       "kubernetes",
-      "aws",
-      "git",
-      "maven",
       "sql",
-      "junit",
-      "agile",
+      "aws",
     ];
 
-    keywords.forEach((keyword) => {
-      if (description.toLowerCase().includes(keyword)) {
-        requirements.push(
-          keyword.charAt(0).toUpperCase() + keyword.slice(1)
-        );
-      }
+    const lowered = description.toLowerCase();
+    return patterns
+      .filter((pattern) => lowered.includes(pattern))
+      .map((pattern) => pattern.replace(/\b\w/g, (match) => match.toUpperCase()));
+  }
+
+  protected extractSalary(description: string): string | undefined {
+    const salaryMatch = description.match(/AUD?\s?\$?\s?\d[\d,]*(?:\s?-\s?AUD?\s?\$?\s?\d[\d,]*)?/i);
+    return salaryMatch?.[0]?.replace(/\s+/g, " ").trim();
+  }
+
+  protected buildListing(params: {
+    title: string;
+    company: string;
+    location: string;
+    url: string;
+    description: string;
+    salary?: string;
+    portalSource: PortalSource;
+    visaSponsorshipMentioned?: boolean;
+  }): JobListing {
+    return JobListingSchema.parse({
+      ...params,
+      salary: params.salary,
+      visaSponsorshipMentioned:
+        params.visaSponsorshipMentioned ?? this.hasVisaSponsorshipMention(params.description),
+      scrapedAt: new Date(),
     });
-
-    return requirements.length > 0 ? requirements : ["See job description"];
   }
 
-  /**
-   * Parse responsibilities from job description
-   */
-  private parseResponsibilities(description: string): string[] {
-    return [
-      "Develop and maintain backend systems",
-      "Write clean, testable code",
-      "Collaborate with team members",
-      "Participate in code reviews",
-    ];
-  }
-
-  /**
-   * Generate sample LinkedIn job for demonstration
-   */
-  private generateSampleLinkedInJob(
-    jobTitle: string,
-    location: string,
-    id: number
-  ): JobDescription {
-    const companies = ["TechCorp", "DataSystems", "CloudInnovate"];
-    return {
-      jobTitle: `${jobTitle} #${id}`,
-      companyName: companies[id - 1],
-      location: location,
-      workType: "Full-time",
-      requirements: [
-        "Java",
-        "Spring Boot",
-        "Microservices",
-        "REST APIs",
-      ],
-      responsibilities: [
-        "Design backend systems",
-        "Code development and testing",
-      ],
-      benefits: ["Competitive salary", "Professional growth"],
-      fullDescription: `Exciting opportunity for ${jobTitle} in ${location}`,
-      salaryRange: `AUD $${90 + id * 10}k - $${120 + id * 20}k`,
-      url: `https://linkedin.com/jobs/view/${id}`,
-    };
-  }
-
-  /**
-   * Close the browser
-   */
-  async close(): Promise<void> {
-    if (this.browser) {
-      await this.browser.close();
-      logger.info("Job Scraper closed");
+  protected dedupeJobs(jobs: JobListing[]): JobListing[] {
+    const unique = new Map<string, JobListing>();
+    for (const job of jobs) {
+      if (!unique.has(job.url)) {
+        unique.set(job.url, job);
+      }
     }
+
+    return [...unique.values()];
+  }
+
+  protected sortByVisaRelevancy(jobs: JobListing[]): JobListing[] {
+    return [...jobs].sort((left, right) => {
+      const leftScore = Number(left.visaSponsorshipMentioned) * 10 + Number(Boolean(left.salary));
+      const rightScore = Number(right.visaSponsorshipMentioned) * 10 + Number(Boolean(right.salary));
+      return rightScore - leftScore;
+    });
   }
 }
 
-export default JobScraper;
+export const jobListingToDescription = (job: JobListing): JobDescription =>
+  JobDescriptionSchema.parse({
+    jobTitle: job.title,
+    companyName: job.company,
+    location: job.location,
+    requirements: [],
+    responsibilities: [],
+    benefits: [],
+    workType: undefined,
+    fullDescription: job.description,
+    salaryRange: job.salary,
+    url: job.url,
+  });

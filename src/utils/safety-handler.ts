@@ -1,4 +1,4 @@
-import logger from "./logger";
+import { logger } from "./logger";
 import { SafetyCheck, BrowserAction } from "../types/index";
 
 /**
@@ -193,4 +193,3 @@ export class SafetyHandler {
   }
 }
 
-export default SafetyHandler;

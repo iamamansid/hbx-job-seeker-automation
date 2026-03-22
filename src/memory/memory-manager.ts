@@ -1,262 +1,190 @@
-import sqlite3 from "sqlite3";
-import { config } from "../config/index";
-import logger from "../utils/logger";
-import { ApplicationRecord, ApplicationRecordSchema } from "../types/index";
-import { v4 as uuidv4 } from "uuid";
+import { Pool } from "pg";
+import { config, type Config } from "../config/index";
+import { logger } from "../utils/logger";
+import { type JobListing, type PortalSource } from "../types/index";
+
+export type RunStatus = "RUNNING" | "COMPLETED" | "FAILED";
+export type JobEventType = "SCRAPED" | "ANALYZED" | "PLANNED" | "APPLIED" | "REJECTED" | "FAILED";
 
 export class MemoryManager {
-  private db: sqlite3.Database | null = null;
+  private pool: Pool | null = null;
+  private currentRunId: number | null = null;
+
+  constructor(private readonly runtimeConfig: Config = config) {}
 
   async initialize(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.db = new sqlite3.Database(config.memory.dbPath, (err) => {
-        if (err) {
-          logger.error("Failed to open database:", err);
-          reject(err);
-        } else {
-          logger.info(`Database initialized at ${config.memory.dbPath}`);
-          this.createTables()
-            .then(() => resolve())
-            .catch(reject);
-        }
-      });
+    if (this.pool) return;
+
+    const connectionString = process.env.DATABASE_URL;
+    if (!connectionString) {
+      throw new Error("DATABASE_URL environment variable is required for PostgreSQL connection");
+    }
+
+    this.pool = new Pool({
+      connectionString,
+      // Default to 10 connections for this application script
+      max: 10,
     });
-  }
 
-  private async createTables(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        reject(new Error("Database not initialized"));
-        return;
-      }
-
-      this.db.serialize(() => {
-        // Applications table
-        this.db!.run(
-          `
-          CREATE TABLE IF NOT EXISTS applications (
-            id TEXT PRIMARY KEY,
-            timestamp INTEGER NOT NULL,
-            companyName TEXT NOT NULL,
-            jobTitle TEXT NOT NULL,
-            jobUrl TEXT UNIQUE NOT NULL,
-            status TEXT NOT NULL,
-            relevanceScore REAL,
-            fillRating REAL,
-            notes TEXT,
-            formDataFilled TEXT,
-            errorLog TEXT,
-            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-          )
-          `,
-          (err) => {
-            if (err) {
-              logger.error("Failed to create applications table:", err);
-              reject(err);
-            } else {
-              logger.info("Applications table ready");
-              resolve();
-            }
-          },
-        );
-
-        // Search history table
-        this.db!.run(
-          `
-          CREATE TABLE IF NOT EXISTS search_history (
-            id TEXT PRIMARY KEY,
-            searchQuery TEXT,
-            resultsCount INTEGER,
-            timestamp INTEGER,
-            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-          )
-          `,
-          (err) => {
-            if (err) logger.error("Failed to create search_history table:", err);
-          },
-        );
-
-        // Rejected jobs table (to avoid re-applying)
-        this.db!.run(
-          `
-          CREATE TABLE IF NOT EXISTS rejected_jobs (
-            id TEXT PRIMARY KEY,
-            jobUrl TEXT UNIQUE NOT NULL,
-            companyName TEXT,
-            reason TEXT,
-            timestamp INTEGER,
-            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-          )
-          `,
-          (err) => {
-            if (err) logger.error("Failed to create rejected_jobs table:", err);
-          },
-        );
-
-        // Create indexes
-        this.db!.run("CREATE INDEX IF NOT EXISTS idx_company ON applications(companyName)");
-        this.db!.run("CREATE INDEX IF NOT EXISTS idx_status ON applications(status)");
-        this.db!.run("CREATE INDEX IF NOT EXISTS idx_timestamp ON applications(timestamp)");
-      });
-    });
+    // We no longer call createTables here, because Flyway will manage schema migrations.
+    logger.info("PostgreSQL memory manager initialized.");
   }
 
   /**
-   * Record a new application
+   * Starts a new Agent Run and records it in the database.
    */
-  async recordApplication(application: Omit<ApplicationRecord, "id" | "timestamp">): Promise<ApplicationRecord> {
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        reject(new Error("Database not initialized"));
-        return;
-      }
-
-      const id = uuidv4();
-      const timestamp = Date.now();
-      const formDataStr = JSON.stringify(application.formDataFilled || {});
-
-      this.db.run(
-        `
-        INSERT INTO applications (id, timestamp, companyName, jobTitle, jobUrl, status, relevanceScore, fillRating, notes, formDataFilled, errorLog)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `,
-        [
-          id,
-          timestamp,
-          application.companyName,
-          application.jobTitle,
-          application.jobUrl,
-          application.status,
-          application.relevanceScore,
-          application.fillRating,
-          application.notes,
-          formDataStr,
-          application.errorLog,
-        ],
-        (err) => {
-          if (err) {
-            logger.error("Failed to record application:", err);
-            reject(err);
-          } else {
-            logger.info(`Application recorded: ${application.companyName} - ${application.jobTitle}`);
-            resolve({
-              ...application,
-              id,
-              timestamp,
-            });
-          }
-        },
-      );
-    });
+  async startRun(searchTerms: string, location: string): Promise<number> {
+    const pool = this.ensurePool();
+    const result = await pool.query(
+      `INSERT INTO agent_run (status, search_terms, location) VALUES ($1, $2, $3) RETURNING id`,
+      ["RUNNING", searchTerms, location]
+    );
+    this.currentRunId = parseInt(result.rows[0].id, 10);
+    logger.info(`Started new Agent Run ID: ${this.currentRunId}`);
+    return this.currentRunId;
   }
 
   /**
-   * Check if job has already been applied to
+   * Finalizes the current Agent Run.
+   */
+  async endRun(status: "COMPLETED" | "FAILED"): Promise<void> {
+    const pool = this.ensurePool();
+    if (!this.currentRunId) return;
+
+    await pool.query(
+      `UPDATE agent_run SET status = $1, end_time = NOW() WHERE id = $2`,
+      [status, this.currentRunId]
+    );
+    logger.info(`Ended Agent Run ID: ${this.currentRunId} with status ${status}`);
+    this.currentRunId = null;
+  }
+
+  /**
+   * Stores a newly scraped job listing, or updates if the URL already exists.
+   * Emits a SCRAPED event for the job.
+   */
+  async storeJobListing(job: JobListing): Promise<number> {
+    const pool = this.ensurePool();
+    
+    // UPSERT the job listing
+    const result = await pool.query(
+      `INSERT INTO job_listing (
+        run_id, title, company, location, url, description, 
+        portal_source, salary, visa_sponsorship_mentioned
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      ON CONFLICT (url) DO UPDATE SET 
+        title = EXCLUDED.title,
+        company = EXCLUDED.company,
+        location = EXCLUDED.location,
+        description = EXCLUDED.description,
+        salary = EXCLUDED.salary,
+        portal_source = EXCLUDED.portal_source,
+        visa_sponsorship_mentioned = EXCLUDED.visa_sponsorship_mentioned
+      RETURNING id
+      `,
+      [
+        this.currentRunId,
+        job.title,
+        job.company,
+        job.location,
+        job.url,
+        job.description,
+        job.portalSource,
+        job.salary || null,
+        job.visaSponsorshipMentioned
+      ]
+    );
+
+    const jobId = parseInt(result.rows[0].id, 10);
+
+    // Record SCRAPED event
+    await this.logEvent(jobId, 'SCRAPED', `Scraped from ${job.portalSource}`);
+    
+    return jobId;
+  }
+
+  /**
+   * Looks up a job by its unique URL
+   */
+  async getJobIdByUrl(url: string): Promise<number | null> {
+    const pool = this.ensurePool();
+    const result = await pool.query(
+      `SELECT id FROM job_listing WHERE url = $1`,
+      [url]
+    );
+    return result.rows.length ? parseInt(result.rows[0].id, 10) : null;
+  }
+
+  /**
+   * Logs an event for a specific job in the pipeline (e.g. ANALYZED, PLANNED, APPLIED)
+   */
+  async logEvent(jobId: number, eventType: JobEventType, message: string, data?: any): Promise<void> {
+    const pool = this.ensurePool();
+    await pool.query(
+      `INSERT INTO job_event (job_id, event_type, event_message, event_data)
+       VALUES ($1, $2, $3, $4)`,
+      [jobId, eventType, message, data ? JSON.stringify(data) : null]
+    );
+  }
+
+  /**
+   * Retrieves all URLs that have ever been recorded to prevent duplicate scrapes/processing if needed
+   */
+  async getKnownJobUrls(): Promise<Set<string>> {
+    const pool = this.ensurePool();
+    const result = await pool.query(`SELECT url FROM job_listing`);
+    return new Set(result.rows.map(row => row.url));
+  }
+
+  /**
+   * Checks if a specific job has successfully been applied to ("APPLIED" event exists)
    */
   async hasAppliedBefore(jobUrl: string): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        reject(new Error("Database not initialized"));
-        return;
-      }
-
-      this.db.get("SELECT id FROM applications WHERE jobUrl = ?", [jobUrl], (err, row) => {
-        if (err) {
-          logger.error("Failed to check application history:", err);
-          reject(err);
-        } else {
-          resolve(!!row);
-        }
-      });
-    });
+    const pool = this.ensurePool();
+    const result = await pool.query(
+      `SELECT 1 FROM job_event je 
+       JOIN job_listing jl ON je.job_id = jl.id 
+       WHERE jl.url = $1 AND je.event_type = 'APPLIED' LIMIT 1`,
+      [jobUrl]
+    );
+    return result.rows.length > 0;
   }
 
   /**
-   * Check if job is in rejected list
+   * Checks if a job has been rejected during analysis ("REJECTED" event exists)
    */
   async isJobRejected(jobUrl: string): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        reject(new Error("Database not initialized"));
-        return;
-      }
-
-      this.db.get("SELECT id FROM rejected_jobs WHERE jobUrl = ?", [jobUrl], (err, row) => {
-        if (err) {
-          logger.error("Failed to check rejected jobs:", err);
-          reject(err);
-        } else {
-          resolve(!!row);
-        }
-      });
-    });
+    const pool = this.ensurePool();
+    const result = await pool.query(
+      `SELECT 1 FROM job_event je 
+       JOIN job_listing jl ON je.job_id = jl.id 
+       WHERE jl.url = $1 AND je.event_type = 'REJECTED' LIMIT 1`,
+      [jobUrl]
+    );
+    return result.rows.length > 0;
   }
 
   /**
-   * Record a rejected job
+   * Legacy interface to record rejection
    */
   async recordRejectedJob(jobUrl: string, companyName: string, reason: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        reject(new Error("Database not initialized"));
-        return;
-      }
-
-      this.db.run(
-        "INSERT OR IGNORE INTO rejected_jobs (id, jobUrl, companyName, reason, timestamp) VALUES (?, ?, ?, ?, ?)",
-        [uuidv4(), jobUrl, companyName, reason, Date.now()],
-        (err) => {
-          if (err) {
-            logger.error("Failed to record rejected job:", err);
-            reject(err);
-          } else {
-            logger.info(`Job rejected and recorded: ${jobUrl}`);
-            resolve();
-          }
-        },
-      );
-    });
+    let jobId = await this.getJobIdByUrl(jobUrl);
+    if (!jobId) {
+       // If job doesn't exist yet, we store a stub to track it
+       jobId = await this.storeJobListing({
+         url: jobUrl,
+         title: "Unknown",
+         company: companyName,
+         location: "Unknown",
+         description: "",
+         portalSource: "LinkedIn", // Stub
+         visaSponsorshipMentioned: false,
+         scrapedAt: new Date()
+       } as JobListing);
+    }
+    await this.logEvent(jobId, 'REJECTED', reason);
   }
 
-  /**
-   * Get application history
-   */
-  async getApplicationHistory(limit: number = 50, status?: string): Promise<ApplicationRecord[]> {
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        reject(new Error("Database not initialized"));
-        return;
-      }
-
-      let query = "SELECT * FROM applications";
-      const params: any[] = [];
-
-      if (status) {
-        query += " WHERE status = ?";
-        params.push(status);
-      }
-
-      query += " ORDER BY timestamp DESC LIMIT ?";
-      params.push(limit);
-
-      this.db.all(query, params, (err, rows) => {
-        if (err) {
-          logger.error("Failed to retrieve application history:", err);
-          reject(err);
-        } else {
-          const applications = (rows || []).map((row: any) => ({
-            ...row,
-            formDataFilled: JSON.parse(row.formDataFilled || "{}"),
-          }));
-          resolve(applications);
-        }
-      });
-    });
-  }
-
-  /**
-   * Get statistics
-   */
   async getStatistics(): Promise<{
     totalApplications: number;
     appliedCount: number;
@@ -264,97 +192,51 @@ export class MemoryManager {
     uniqueCompanies: number;
     successRate: number;
   }> {
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        reject(new Error("Database not initialized"));
-        return;
-      }
-
-      this.db.all(
-        `
-        SELECT 
-          COUNT(*) as totalApplications,
-          SUM(CASE WHEN status = 'applied' THEN 1 ELSE 0 END) as appliedCount,
-          SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failedCount,
-          COUNT(DISTINCT companyName) as uniqueCompanies
-        FROM applications
-        `,
-        (err, rows) => {
-          if (err) {
-            logger.error("Failed to get statistics:", err);
-            reject(err);
-          } else {
-            const row = (rows || [{}])[0] as any;
-            const totalApplications = row.totalApplications || 0;
-            const appliedCount = row.appliedCount || 0;
-            const failedCount = row.failedCount || 0;
-            const uniqueCompanies = row.uniqueCompanies || 0;
-            const successRate = totalApplications > 0 ? (appliedCount / totalApplications) * 100 : 0;
-
-            resolve({
-              totalApplications,
-              appliedCount,
-              failedCount,
-              uniqueCompanies,
-              successRate,
-            });
-          }
-        },
-      );
-    });
+    const pool = this.ensurePool();
+    
+    // Applications attempted means we reached the execution phase
+    // Note: With the new event system, 'failed' is tracked by absence of APPLIED after PLANNED? 
+    // Or we should introduce a FAILED_APPLICATION event.
+    // For now we map this from job_events:
+    
+    const result = await pool.query(`
+      SELECT 
+        COUNT(DISTINCT jl.id) as total_jobs,
+        COUNT(DISTINCT CASE WHEN je.event_type = 'APPLIED' THEN jl.id END) as applied_count,
+        COUNT(DISTINCT CASE WHEN je.event_type = 'FAILED' THEN jl.id END) as failed_count,
+        COUNT(DISTINCT jl.company) as unique_companies
+      FROM job_listing jl
+      LEFT JOIN job_event je ON jl.id = je.job_id
+    `);
+    
+    const row = result.rows[0];
+    const appliedCount = parseInt(row.applied_count) || 0;
+    const failedCount = parseInt(row.failed_count) || 0;
+    const totalApplications = parseInt(row.total_jobs) || 0;
+    
+    const completed = appliedCount + failedCount;
+    const successRate = completed === 0 ? 0 : (appliedCount / completed) * 100;
+    
+    return {
+      totalApplications,
+      appliedCount,
+      failedCount,
+      uniqueCompanies: parseInt(row.unique_companies) || 0,
+      successRate
+    };
   }
 
-  /**
-   * Update application status
-   */
-  async updateApplicationStatus(
-    applicationId: string,
-    status: string,
-    fillRating?: number,
-    notes?: string,
-  ): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        reject(new Error("Database not initialized"));
-        return;
-      }
-
-      this.db.run(
-        "UPDATE applications SET status = ?, fillRating = ?, notes = ? WHERE id = ?",
-        [status, fillRating, notes, applicationId],
-        (err) => {
-          if (err) {
-            logger.error("Failed to update application:", err);
-            reject(err);
-          } else {
-            logger.info(`Application ${applicationId} updated to status: ${status}`);
-            resolve();
-          }
-        },
-      );
-    });
-  }
-
-  /**
-   * Close database connection
-   */
   async close(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (this.db) {
-        this.db.close((err) => {
-          if (err) {
-            logger.error("Failed to close database:", err);
-            reject(err);
-          } else {
-            logger.info("Database closed");
-            resolve();
-          }
-        });
-      } else {
-        resolve();
-      }
-    });
+    if (!this.pool) return;
+    logger.info("Closing PostgreSQL connection pool...");
+    await this.pool.end();
+    this.pool = null;
+  }
+
+  private ensurePool(): Pool {
+    if (!this.pool) {
+      throw new Error("Database pool not initialized. Call initialize() first.");
+    }
+    return this.pool;
   }
 }
-
-export default MemoryManager;

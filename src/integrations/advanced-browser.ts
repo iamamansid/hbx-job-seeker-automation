@@ -1,12 +1,12 @@
 import { Browser, Page } from "playwright";
 import { chromium } from "playwright";
-import logger from "../utils/logger";
+import { logger } from "../utils/logger";
 
 /**
  * Advanced Browser Automation - Real job board navigation and application
  * Handles Seek.com.au, Indeed, and LinkedIn job searching and applying
  */
-class AdvancedBrowserAutomation {
+export class AdvancedBrowserAutomation {
   private browser: Browser | null = null;
   private page: Page | null = null;
 
@@ -328,4 +328,3 @@ class AdvancedBrowserAutomation {
   }
 }
 
-export default AdvancedBrowserAutomation;

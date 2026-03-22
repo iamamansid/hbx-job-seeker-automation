@@ -1,4 +1,4 @@
-import logger from "./logger";
+import { logger } from "./logger";
 import { Form, FormField } from "../types/index";
 
 /**
@@ -203,4 +203,3 @@ export class FormAnalyzer {
   }
 }
 
-export default FormAnalyzer;
