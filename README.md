@@ -1,6 +1,6 @@
 # Autonomous Local Job Application Agent
 
-A sophisticated, **fully local** autonomous AI job application agent that operates without any cloud APIs. Uses gpt-oss:120b-cloud running locally via Ollama, Node.js, and Playwright.
+A sophisticated, **fully local** autonomous AI job application agent that operates without any cloud APIs. Uses Llama 3.2 running locally via Ollama, Node.js, and Playwright.
 
 ## 🎯 Key Features
 
@@ -57,7 +57,7 @@ Jobs    Check      Form  Form    Fill    Insights
 
 ### Required
 - **Node.js** 18+ ([download](https://nodejs.org/))
-- **Ollama** with gpt-oss:120b-cloud ([download](https://ollama.ai))
+- **Ollama** with Llama 3.2 ([download](https://ollama.ai))
 - **Playwright** (auto-installed)
 - **SQLite3** (auto-installed)
 
@@ -88,8 +88,8 @@ yarn install
 # Run Ollama service
 ollama serve
 
-# In another terminal, download gpt-oss:120b-cloud
-ollama pull gpt-oss:120b-cloud
+# In another terminal, download Llama 3.2
+ollama pull llama2
 # Or try neural-chat for smaller size:
 ollama pull neural-chat
 ```
@@ -171,7 +171,7 @@ All settings in `.env` file:
 
 | Setting | Purpose | Default |
 |---------|---------|---------|
-| `OLLAMA_MODEL` | LLM model to use | `gpt-oss:120b-cloud` |
+| `OLLAMA_MODEL` | LLM model to use | `llama2` |
 | `ENABLE_AUTO_SUBMIT` | Auto-click submit (⚠️ safety off) | `false` |
 | `MAX_JOBS_TO_APPLY` | Jobs to apply per session | `5` |
 | `BROWSER_HEADLESS` | Hide browser window | `true` |
@@ -310,7 +310,7 @@ curl http://localhost:11434/api/tags
 ollama list
 
 # Install a model
-ollama pull gpt-oss:120b-cloud
+ollama pull llama2
 ollama pull neural-chat  # Faster, smaller
 ```
 

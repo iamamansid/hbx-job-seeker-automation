@@ -10,7 +10,6 @@ node_modules/
 
 # lock files (optional — keep ONE if you prefer reproducible builds)
 
-package-lock.json
 yarn.lock
 pnpm-lock.yaml
 
@@ -31,6 +30,10 @@ out/
 
 # ==============================
 
+# SEEK session — contains auth cookies, never commit
+data/session.json
+
+# Environment secrets
 .env
 .env.local
 .env.*.local
@@ -60,6 +63,7 @@ data/*
 # browser sessions / automation storage
 
 data/chrome-session/
+data/chrome-profile-temp/
 data/playwright/
 data/cache/
 data/tmp/
