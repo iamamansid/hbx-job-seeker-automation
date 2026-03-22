@@ -1,59 +1,87 @@
 /**
  * EXAMPLE: Integration with Job Application Orchestrator
- * 
- * This file demonstrates various ways to use the Job Application Agent
+ *
+ * This file demonstrates various ways to use the current agent graph.
  */
 
-import JobApplicationOrchestrator from "./orchestrator/orchestrator";
-import { JobDescription } from "./types/index";
-import logger from "./utils/logger";
+import { ExecutorAgent } from "./agents/executor-agent";
+import { PlannerAgent } from "./agents/planner-agent";
+import { ProfileReasoner } from "./agents/profile-reasoner";
+import { BrowserAgent } from "./browser/browser-agent";
+import { BrowserLifecycleManager } from "./browser/browser-lifecycle-manager";
+import { config } from "./config/index";
+import { GeminiClient } from "./llm/gemini-client";
+import { MemoryManager } from "./memory/memory-manager";
+import { JobApplicationOrchestrator } from "./orchestrator/orchestrator";
+import { JobListingSchema, type JobListing } from "./types/index";
+
+type ExampleRuntime = {
+  orchestrator: JobApplicationOrchestrator;
+  browserLifecycleManager: BrowserLifecycleManager;
+};
+
+const createExampleRuntime = (): ExampleRuntime => {
+  const browserLifecycleManager = BrowserLifecycleManager.getInstance(config);
+  const llmClient = new GeminiClient(config);
+  const memoryManager = new MemoryManager(config);
+  const browserAgent = new BrowserAgent(browserLifecycleManager, config);
+  const profileReasoner = new ProfileReasoner(llmClient, config);
+  const plannerAgent = new PlannerAgent(llmClient, config);
+  const executorAgent = new ExecutorAgent(browserAgent, profileReasoner, llmClient, config);
+  const orchestrator = new JobApplicationOrchestrator(
+    plannerAgent,
+    executorAgent,
+    memoryManager,
+    config,
+  );
+
+  return { orchestrator, browserLifecycleManager };
+};
+
+const cleanupRuntime = async ({
+  orchestrator,
+  browserLifecycleManager,
+}: ExampleRuntime): Promise<void> => {
+  await orchestrator.cleanup().catch(() => undefined);
+  await browserLifecycleManager.closeAll().catch(() => undefined);
+};
+
+const createSampleJob = (overrides: Partial<JobListing> = {}): JobListing =>
+  JobListingSchema.parse({
+    title: "Senior Backend Engineer",
+    company: "TechStartup Inc",
+    location: "Sydney, NSW",
+    url: "https://example.com/job/senior-backend-engineer",
+    description: `We are looking for an experienced Senior Backend Engineer to join our growing team.
+You will build Java and Spring Boot services, improve API performance, and work across cloud-native systems.
+Visa sponsorship is available for strong candidates with backend and microservices experience.`,
+    salary: "AUD 150,000 - 180,000",
+    portalSource: "LinkedIn",
+    visaSponsorshipMentioned: true,
+    scrapedAt: new Date(),
+    ...overrides,
+  });
 
 /**
- * Example 1: Process a single job from URL and job description
+ * Example 1: Process a single job listing
  */
 async function example_singleJob() {
   console.log("\n=== Example 1: Single Job Application ===\n");
 
-  const orchestrator = new JobApplicationOrchestrator();
-  await orchestrator.initialize();
-
-  const jobDescription: JobDescription = {
-    jobTitle: "Senior Backend Engineer",
-    companyName: "TechStartup Inc",
-    location: "San Francisco, CA",
-    workType: "Hybrid",
-    requirements: [
-      "5+ years JavaScript/TypeScript",
-      "Node.js and Express experience",
-      "Database design and optimization",
-      "Microservices architecture",
-      "Docker and Kubernetes",
-    ],
-    responsibilities: [
-      "Design and implement scalable backend systems",
-      "Lead architectural discussions with team",
-      "Mentor junior developers",
-      "Optimize database queries and API performance",
-    ],
-    benefits: [
-      "Competitive salary ($150k-$200k)",
-      "Stock options",
-      "Health insurance",
-      "Remote flexibility",
-      "Professional development budget",
-    ],
-    fullDescription: `We are looking for an experienced Senior Backend Engineer to join our growing team. 
-      You'll be working on our cloud infrastructure, building APIs, and designing systems that serve millions of users.
-      Must have strong experience with Node.js and modern JavaScript. Kubernetes experience is a plus.`,
-    salaryRange: "$150,000 - $200,000",
-  };
+  const runtime = createExampleRuntime();
+  const { orchestrator } = runtime;
 
   try {
-    // Process the job
-    await orchestrator.processJob("https://example.com/job/senior-backend-engineer", jobDescription);
-    console.log("✓ Job processing completed");
+    await orchestrator.initialize();
+    await orchestrator.processJob(
+      createSampleJob({
+        title: "Senior Backend Engineer",
+        company: "TechStartup Inc",
+      }),
+    );
+    console.log("Completed single job processing");
   } finally {
-    await orchestrator.cleanup();
+    await cleanupRuntime(runtime);
   }
 }
 
@@ -63,81 +91,69 @@ async function example_singleJob() {
 async function example_batchJobs() {
   console.log("\n=== Example 2: Batch Job Processing ===\n");
 
-  const orchestrator = new JobApplicationOrchestrator();
-  await orchestrator.initialize();
+  const runtime = createExampleRuntime();
+  const { orchestrator } = runtime;
 
-  const jobs = [
-    {
+  const jobs: JobListing[] = [
+    createSampleJob({
+      title: "Backend Engineer",
+      company: "Company A",
+      location: "Melbourne, VIC",
       url: "https://example.com/job/backend-engineer-1",
-      description: {
-        jobTitle: "Backend Engineer",
-        companyName: "Company A",
-        location: "New York, NY",
-        workType: "Remote",
-        requirements: ["Java", "Spring Boot"],
-      } as JobDescription,
-    },
-    {
+      description: "Java, Spring Boot, REST APIs, and visa sponsorship available in Melbourne.",
+      portalSource: "Seek",
+    }),
+    createSampleJob({
+      title: "Senior Backend Engineer",
+      company: "Company B",
+      location: "Brisbane, QLD",
       url: "https://example.com/job/backend-engineer-2",
-      description: {
-        jobTitle: "Senior Backend Engineer",
-        companyName: "Company B",
-        location: "San Francisco, CA",
-        workType: "Hybrid",
-        requirements: ["Java", "Kubernetes", "Microservices"],
-      } as JobDescription,
-    },
-    {
+      description: "Microservices, Kubernetes, and sponsorship support for relocation to Brisbane.",
+      portalSource: "Indeed",
+    }),
+    createSampleJob({
+      title: "Full Stack Developer",
+      company: "Company C",
+      location: "Remote",
       url: "https://example.com/job/fullstack-developer",
-      description: {
-        jobTitle: "Full Stack Developer",
-        companyName: "Company C",
-        location: "Remote",
-        workType: "Remote",
-        requirements: ["Node.js", "React", "MongoDB"],
-      } as JobDescription,
-    },
+      description: "Node.js, React, MongoDB, and occasional backend work. Sponsorship not mentioned.",
+      portalSource: "ETaxJobs",
+      visaSponsorshipMentioned: false,
+    }),
   ];
 
   try {
-    // Process multiple jobs
+    await orchestrator.initialize();
     await orchestrator.processJobs(jobs);
-    console.log("✓ Batch processing completed");
+    console.log("Completed batch processing");
   } finally {
-    await orchestrator.cleanup();
+    await cleanupRuntime(runtime);
   }
 }
 
 /**
- * Example 3: Integration with LinkedIn API (placeholder)
+ * Example 3: Integration with LinkedIn scraping results
  */
 async function example_linkedinIntegration() {
   console.log("\n=== Example 3: LinkedIn Integration (Placeholder) ===\n");
 
-  // This is where you would integrate LinkedIn API
-  // In production, you might:
-  // 1. Auth to LinkedIn
-  // 2. Search for jobs
-  // 3. Parse job descriptions
-  // 4. Extract job posting URLs
-
-  const linkedinJobs: Array<{ url: string; description: JobDescription }> = [
-    // Would be populated from LinkedIn API
+  const linkedinJobs: JobListing[] = [
+    // Populate this array with scraped LinkedIn job listings.
   ];
 
-  if (linkedinJobs.length > 0) {
-    const orchestrator = new JobApplicationOrchestrator();
-    await orchestrator.initialize();
+  if (linkedinJobs.length === 0) {
+    console.log("LinkedIn integration requires collected JobListing objects before processing.");
+    return;
+  }
 
-    try {
-      await orchestrator.processJobs(linkedinJobs);
-    } finally {
-      await orchestrator.cleanup();
-    }
-  } else {
-    console.log(
-      "LinkedIn integration requires API credentials. See documentation for setup.",
-    );
+  const runtime = createExampleRuntime();
+  const { orchestrator } = runtime;
+
+  try {
+    await orchestrator.initialize();
+    await orchestrator.processJobs(linkedinJobs);
+  } finally {
+    await cleanupRuntime(runtime);
   }
 }
 
@@ -147,18 +163,10 @@ async function example_linkedinIntegration() {
 async function example_indeedIntegration() {
   console.log("\n=== Example 4: Indeed Integration (Placeholder) ===\n");
 
-  // In production, you might use a library like cheerio to scrape Indeed
-  // Or use Indeed's API if available
-
-  const indeedJobs: Array<{ url: string; description: JobDescription }> = [];
-
-  // Example of how you might parse Indeed pages:
-  // 1. Use Playwright to navigate Indeed search
-  // 2. Extract job titles and links
-  // 3. Click each link and scrape description
-  // 4. Process through orchestrator
-
-  console.log("Indeed integration could be added using web scraping...");
+  console.log("Indeed integration would typically:");
+  console.log("  1. Search job results with Playwright");
+  console.log("  2. Map scraped fields into JobListing objects");
+  console.log("  3. Pass the resulting listings to orchestrator.processJobs()");
 }
 
 /**
@@ -167,26 +175,22 @@ async function example_indeedIntegration() {
 async function example_continuousMonitoring() {
   console.log("\n=== Example 5: Continuous Job Monitoring ===\n");
 
-  const orchestrator = new JobApplicationOrchestrator();
-  await orchestrator.initialize();
+  const runtime = createExampleRuntime();
+  const { orchestrator } = runtime;
 
   const searchTerms = [
-    "JavaScript Backend Engineer",
-    "Node.js Developer",
-    "Full Stack Engineer",
+    "Java Backend Engineer visa sponsorship",
+    "Spring Boot Developer Australia",
+    "Backend Engineer 482 visa",
   ];
 
-  // In production, this would:
-  // 1. Search for jobs matching terms
-  // 2. Extract new job postings
-  // 3. Process each one
-  // 4. Wait before next run
-  // 5. Repeat on schedule
-
-  console.log(`Would monitor ${searchTerms.length} search terms...`);
-  console.log("In production, this would run continuously and check for new jobs");
-
-  await orchestrator.cleanup();
+  try {
+    await orchestrator.initialize();
+    console.log(`Would monitor ${searchTerms.length} search terms...`);
+    console.log("In production, this would run continuously and process new listings on a schedule.");
+  } finally {
+    await cleanupRuntime(runtime);
+  }
 }
 
 /**
@@ -195,20 +199,17 @@ async function example_continuousMonitoring() {
 async function example_statistics() {
   console.log("\n=== Example 6: Application Statistics ===\n");
 
-  const orchestrator = new JobApplicationOrchestrator();
-  await orchestrator.initialize();
+  const runtime = createExampleRuntime();
+  const { orchestrator } = runtime;
 
-  // Get historical data
-  const state = orchestrator.getState();
-  console.log(`Historical applications: ${state.historicalData.length}`);
-
-  // Get from memory/database through orchestrator's memory manager
-  // In production, you'd expose memory methods
-
-  console.log("Statistics tracking is built into the memory system");
-  console.log("Check data/applications.db for detailed application history");
-
-  await orchestrator.cleanup();
+  try {
+    await orchestrator.initialize();
+    const state = orchestrator.getState();
+    console.log(`Historical applications tracked in memory: ${state.historicalData.length}`);
+    console.log("Persistent statistics are stored through the PostgreSQL-backed memory manager.");
+  } finally {
+    await cleanupRuntime(runtime);
+  }
 }
 
 /**
@@ -217,24 +218,24 @@ async function example_statistics() {
 function example_configuration() {
   console.log("\n=== Example 7: Configuration ===\n");
 
-  console.log("All settings via .env file:");
-  console.log("  - OLLAMA_MODEL: Which LLM to use");
-  console.log("  - ENABLE_AUTO_SUBMIT: Auto-submit forms (default: false for safety)");
-  console.log("  - MAX_JOBS_TO_APPLY: Max applications per session");
-  console.log("  - BROWSER_HEADLESS: Show/hide browser window");
-  console.log("  - LOG_LEVEL: Logging verbosity");
-  console.log("  - CANDIDATE_* : Your profile information");
+  console.log("Primary settings via .env file:");
+  console.log("  - GEMINI_API_KEY: Gemini API credentials");
+  console.log("  - GEMINI_TIMEOUT_MS: LLM request timeout");
+  console.log("  - GEMINI_TEMPERATURE: LLM sampling temperature");
+  console.log("  - SEARCH_TERMS: Comma-separated search terms");
+  console.log("  - MAX_APPLICATIONS_PER_RUN: Per-session application cap");
+  console.log("  - BROWSER_HEADLESS: Show or hide the browser");
+  console.log("  - DATABASE_URL: PostgreSQL connection string");
+  console.log("  - CANDIDATE_*: Candidate profile information");
 
-  console.log(
-    "\nDo NOT change code for configuration - use .env file instead",
-  );
+  console.log("\nPrefer environment configuration over hard-coded application changes.");
 }
 
 /**
  * Main function with menu
  */
 async function main() {
-  console.log("\n" + "=".repeat(60));
+  console.log(`\n${"=".repeat(60)}`);
   console.log("AUTONOMOUS JOB APPLICATION AGENT - EXAMPLES");
   console.log("=".repeat(60));
   console.log("\nAvailable examples:");
@@ -248,14 +249,13 @@ async function main() {
 
   console.log("\nTo use:");
   console.log("  - Copy example code into your main application");
-  console.log("  - Run specific orchestrator method you need");
-  console.log("  - Customize job sources and search terms");
+  console.log("  - Build JobListing objects from your scraper");
+  console.log("  - Create the orchestrator with current agent dependencies");
 
   console.log("\nFor more info, see README.md");
-  console.log("=".repeat(60) + "\n");
+  console.log(`${"=".repeat(60)}\n`);
 }
 
-// Export examples for use in other files
 export {
   example_singleJob,
   example_batchJobs,
@@ -266,7 +266,6 @@ export {
   example_configuration,
 };
 
-// Run if executed directly
 if (require.main === module) {
-  main();
+  void main();
 }

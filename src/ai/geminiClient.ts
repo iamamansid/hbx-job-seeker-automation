@@ -12,32 +12,27 @@ type GeminiGenerateOptions = {
   logResponsePreview?: boolean;
 };
 
-type VertexPart = {
+type GeminiPart = {
   text?: string;
-  thought?: boolean;
 };
 
-type VertexCandidate = {
+type GeminiCandidate = {
   content?: {
-    parts?: VertexPart[];
+    parts?: GeminiPart[];
   };
 };
 
-type VertexGenerateContentResponse = {
-  candidates?: VertexCandidate[];
+type GeminiGenerateContentResponse = {
+  candidates?: GeminiCandidate[];
 };
 
 class GeminiClient {
   private static instance: GeminiClient;
 
   private readonly modelName = seekConfig.ai.model;
-
   private readonly apiKey = seekConfig.ai.apiKey;
-
-  private readonly endpoint = "https://aiplatform.googleapis.com/v1/publishers/google/models";
-
+  private readonly endpoint = "https://generativelanguage.googleapis.com/v1beta/models";
   private lastCallAt = 0;
-
   private callChain: Promise<void> = Promise.resolve();
 
   public static getInstance(): GeminiClient {
@@ -48,27 +43,12 @@ class GeminiClient {
     return GeminiClient.instance;
   }
 
-  private extractTextFromChunk(chunk: VertexGenerateContentResponse): string {
-    return (chunk.candidates ?? [])
+  private extractTextFromResponse(data: GeminiGenerateContentResponse): string {
+    return (data.candidates ?? [])
       .flatMap((candidate) => candidate.content?.parts ?? [])
-      .filter((part) => typeof part.text === "string" && !part.thought)
       .map((part) => part.text ?? "")
-      .join("");
-  }
-
-  private extractTextFromResponse(data: unknown): string {
-    if (Array.isArray(data)) {
-      return data
-        .map((chunk) => this.extractTextFromChunk(chunk as VertexGenerateContentResponse))
-        .join("")
-        .trim();
-    }
-
-    if (data && typeof data === "object") {
-      return this.extractTextFromChunk(data as VertexGenerateContentResponse).trim();
-    }
-
-    return "";
+      .join("")
+      .trim();
   }
 
   public async generate(
@@ -87,7 +67,7 @@ class GeminiClient {
         logger.info("Gemini request started", {
           label: options.label ?? "unspecified",
           model: this.modelName,
-          apiSurface: "vertex-express-stream",
+          apiSurface: "gemini-direct-rest",
           temperature: effectiveTemperature,
           promptChars: prompt.length,
           queuedDelayMs: waitMs,
@@ -103,8 +83,8 @@ class GeminiClient {
           await sleep(waitMs);
         }
 
-        const response = await axios.post<VertexGenerateContentResponse[] | VertexGenerateContentResponse>(
-          `${this.endpoint}/${this.modelName}:streamGenerateContent`,
+        const response = await axios.post<GeminiGenerateContentResponse>(
+          `${this.endpoint}/${this.modelName}:generateContent`,
           {
             contents: [
               {
@@ -118,13 +98,11 @@ class GeminiClient {
             },
           },
           {
-            params: {
-              key: this.apiKey,
-            },
             headers: {
               "Content-Type": "application/json",
+              "x-goog-api-key": this.apiKey,
             },
-            timeout: 120000,
+            timeout: 120_000,
           },
         );
 
@@ -132,13 +110,13 @@ class GeminiClient {
         const responseText = this.extractTextFromResponse(response.data);
 
         if (!responseText) {
-          throw new Error("Vertex Gemini response did not contain any text parts.");
+          throw new Error("Gemini response did not contain any text parts.");
         }
 
         logger.info("Gemini request completed", {
           label: options.label ?? "unspecified",
           model: this.modelName,
-          apiSurface: "vertex-express-stream",
+          apiSurface: "gemini-direct-rest",
           temperature: effectiveTemperature,
           promptChars: prompt.length,
           responseChars: responseText.length,
@@ -158,7 +136,7 @@ class GeminiClient {
           error,
           label: options.label ?? "unspecified",
           model: this.modelName,
-          apiSurface: "vertex-express-stream",
+          apiSurface: "gemini-direct-rest",
           temperature: effectiveTemperature,
           promptChars: prompt.length,
           durationMs: Date.now() - startedAt,
